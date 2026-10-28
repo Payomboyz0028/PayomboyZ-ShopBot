@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+scratch/
+output/
+cache/
+bin/
+*.db
+*.sqlite3
+*.exe
+*.zip
+Lerning/
+Prometheus-WeAre-Devs-Dumper-main/
