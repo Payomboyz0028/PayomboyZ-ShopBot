@@ -156,6 +156,49 @@ def get_balance(user_id):
         print(f"[Supabase get_balance Error] {e}")
         return 0.0
 
+def _sync_user_balance_and_topup(sb, uid, new_bal, new_topup=None):
+    """Synchronizes user balance and topup stats across both public.members and public.customers."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # 1. Update members table
+    mem_payload = {
+        "discord_id": uid,
+        "username": f"user_{uid}",
+        "balance": new_bal,
+        "last_active": now_iso
+    }
+    if new_topup is not None:
+        mem_payload["total_topup"] = new_topup
+    sb.table("members").upsert(mem_payload, on_conflict="discord_id").execute()
+
+    # 2. Update customers table (Unified Web & Bot SSOT)
+    try:
+        cust_payload = {
+            "balance": new_bal,
+            "balance_thb": new_bal,
+            "last_active": now_iso
+        }
+        if new_topup is not None:
+            cust_payload["total_topup"] = new_topup
+        upd = sb.table("customers").update(cust_payload).eq("discord_id", uid).execute()
+        if not upd.data:
+            upd2 = sb.table("customers").update(cust_payload).eq("id", str(uid)).execute()
+            if not upd2.data:
+                cust_insert = {
+                    "id": str(uid),
+                    "discord_id": uid,
+                    "username": f"user_{uid}",
+                    "balance": new_bal,
+                    "balance_thb": new_bal,
+                    "total_topup": new_topup if new_topup is not None else 0,
+                    "rank": "Member",
+                    "role": "Member",
+                    "created_at": now_iso,
+                    "last_active": now_iso
+                }
+                sb.table("customers").upsert(cust_insert, on_conflict="id").execute()
+    except Exception as ce:
+        print(f"[Supabase customers sync warning] {ce}")
+
 def set_balance(user_id, amount):
     """Set absolute THB balance for customer."""
     try:
@@ -185,12 +228,7 @@ def adjust_balance(user_id, admin_id, delta, reason):
         new_bal = cur_bal + diff
         if new_bal < 0:
             return False
-        sb.table("members").upsert({
-            "discord_id": uid,
-            "username": f"user_{uid}",
-            "balance": new_bal,
-            "last_active": datetime.now(timezone.utc).isoformat()
-        }, on_conflict="discord_id").execute()
+        _sync_user_balance_and_topup(sb, uid, new_bal)
         try:
             sb.table("balance_adjustments").insert({
                 "user_id": uid,
@@ -207,7 +245,7 @@ def adjust_balance(user_id, admin_id, delta, reason):
         return False
 
 def credit_topup(user_id, amount, payment_ref):
-    """Process topup atomically: record in topups and increment balance."""
+    """Process topup atomically: record in topups and increment balance across members & customers."""
     try:
         uid = int(user_id)
         amt = float(amount)
@@ -239,13 +277,7 @@ def credit_topup(user_id, amount, payment_ref):
         new_bal = cur_bal + amt
         new_topup = cur_topup + amt
 
-        sb.table("members").upsert({
-            "discord_id": uid,
-            "username": f"user_{uid}",
-            "balance": new_bal,
-            "total_topup": new_topup,
-            "last_active": datetime.now(timezone.utc).isoformat()
-        }, on_conflict="discord_id").execute()
+        _sync_user_balance_and_topup(sb, uid, new_bal, new_topup)
 
         # 4. Audit log
         try:

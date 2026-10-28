@@ -329,96 +329,97 @@ def redeem_truemoney(link, phone):
         return None, "เบอร์ TrueMoney ของร้านตั้งค่าไม่ถูกต้องครับ"
 
     encoded_code = quote(code, safe="")
+
+    # =========================================================================
+    # Strategy 1: Cloudflare Edge Gateway (Bypasses Datacenter & GeoIP WAF Blocks)
+    # =========================================================================
+    try:
+        gw_url = f"https://tmn-angpao.pages.dev/api/{phone}/{encoded_code}"
+        gw_res = requests.get(gw_url, timeout=10)
+        if gw_res.status_code == 200:
+            gw_data = gw_res.json()
+            if gw_data.get("success") and str(gw_data.get("code")).upper() == "SUCCESS":
+                d = gw_data.get("data") or {}
+                amount = float(d.get("amount") or 0)
+                owner = d.get("name") or "ผู้ส่งซอง"
+                if amount > 0:
+                    return {"amount": amount, "owner": owner, "code": code}, "ok"
+        elif gw_res.status_code in (400, 404):
+            try:
+                gw_data = gw_res.json()
+                err_code = str(gw_data.get("code") or "").upper()
+                msg = gw_data.get("message") or ""
+                if err_code == "VOUCHER_NOT_FOUND":
+                    return None, "ไม่พบซองของขวัญนี้ หรือลิงก์ซองไม่ถูกต้องครับ"
+                if err_code == "VOUCHER_OUT_OF_STOCK":
+                    return None, "ซองของขวัญนี้ถูกกดรับครบแล้วครับ"
+                if err_code == "VOUCHER_EXPIRED":
+                    return None, "ซองของขวัญนี้หมดอายุแล้วครับ"
+                if err_code == "CANNOT_GET_OWN_VOUCHER":
+                    return None, "ไม่สามารถรับซองของเบอร์ตัวเองได้ครับ"
+                if msg:
+                    return None, msg
+            except Exception:
+                pass
+    except Exception as gw_err:
+        print(f"[TrueMoney Edge Gateway Warning] {gw_err}")
+
+    # =========================================================================
+    # Strategy 2: Direct TrueMoney Campaign API (Fallback with Mobile Fingerprint)
+    # =========================================================================
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
             "Mobile/15E148 Safari/604.1"
         ),
+        "Origin": "https://gift.truemoney.com",
         "Referer": f"https://gift.truemoney.com/campaign/?v={encoded_code}",
     }
     try:
-        verify_response = requests.get(
-            TRUEMONEY_VERIFY_URL.format(code=encoded_code),
-            params={"mobile": phone},
-            headers=headers,
-            timeout=15,
-        )
-        if verify_response.status_code != 200:
-            return None, "ระบบ TrueMoney ตรวจซองไม่สำเร็จ ลองใหม่ภายหลังครับ"
-
-        verify_data = verify_response.json()
-        verify_status = verify_data.get("status", {})
-        verify_message = str(verify_status.get("message") or "").lower()
-        verify_code = str(verify_status.get("code") or "").upper()
-        if verify_message != "success" and verify_code != "SUCCESS":
-            return None, verify_status.get("message") or "ซองไม่ถูกต้องหรือใช้ไปแล้วครับ"
-
-        data = verify_data.get("data", {})
-        voucher = data.get("voucher", {})
-        owner = data.get("owner_profile", {}).get("full_name", "ไม่ระบุ")
-        available = int(voucher.get("available", 0))
-        if available <= 0:
-            return None, "ซองนี้ถูกรับครบแล้วครับ"
-
-        fallback_amount = float(voucher.get("amount_baht") or 0)
-        members = int(voucher.get("member") or 1)
-        voucher_type = str(voucher.get("type") or "").upper()
-        if members > 1 and voucher_type == "F":
-            fallback_amount /= members
-        elif members > 1 and voucher_type == "R":
-            if available != 1:
-                return None, "ซองสุ่มหลายผู้รับยังมียอดแบ่งเหลือ จึงยังรับผ่านระบบนี้ไม่ได้ครับ"
-            fallback_amount -= float(voucher.get("redeemed_amount_baht") or 0)
-        if fallback_amount <= 0:
-            return None, "ยอดซองไม่ถูกต้อง จึงยังไม่ได้รับซองครับ"
-
         redeem_response = requests.post(
             TRUEMONEY_REDEEM_URL.format(code=encoded_code),
             headers=headers,
             json={"mobile": phone, "voucher_hash": code},
-            timeout=15,
+            timeout=12,
         )
-        if redeem_response.status_code != 200:
-            return None, "รับซอง TrueMoney ไม่สำเร็จ ลองใหม่หรือติดต่อแอดมินครับ"
+        if redeem_response.status_code == 200:
+            redeem_data = redeem_response.json()
+            redeem_status = redeem_data.get("status", {})
+            redeem_message = str(redeem_status.get("message") or "").lower()
+            redeem_code = str(redeem_status.get("code") or "").upper()
+            if redeem_message == "success" or redeem_code == "SUCCESS":
+                redeemed_data = redeem_data.get("data", {})
+                ticket = redeemed_data.get("my_ticket") or {}
+                amount_value = ticket.get("amount_baht") or redeemed_data.get("amount_baht") or 0
+                amount = float(amount_value)
+                owner = (redeemed_data.get("owner_profile") or {}).get("full_name") or "ผู้ส่งซอง"
+                if amount > 0:
+                    return {"amount": amount, "owner": owner, "code": code}, "ok"
+        elif redeem_response.status_code == 400:
+            try:
+                rdata = redeem_response.json()
+                status = rdata.get("status", {})
+                c = str(status.get("code") or "").upper()
+                msg = status.get("message") or ""
+                if c == "VOUCHER_NOT_FOUND":
+                    return None, "ไม่พบซองของขวัญนี้ หรือลิงก์ซองไม่ถูกต้องครับ"
+                if c == "VOUCHER_OUT_OF_STOCK":
+                    return None, "ซองของขวัญนี้ถูกกดรับครบแล้วครับ"
+                if c == "VOUCHER_EXPIRED":
+                    return None, "ซองของขวัญนี้หมดอายุแล้วครับ"
+                if c == "CANNOT_GET_OWN_VOUCHER":
+                    return None, "ไม่สามารถรับซองของเบอร์ตัวเองได้ครับ"
+                if msg:
+                    return None, msg
+            except Exception:
+                pass
+    except Exception as dir_err:
+        print(f"[TrueMoney Direct API Warning] {dir_err}")
 
-        redeem_data = redeem_response.json()
-        redeem_status = redeem_data.get("status", {})
-        redeem_message = str(redeem_status.get("message") or "").lower()
-        redeem_code = str(redeem_status.get("code") or "").upper()
-        if redeem_message != "success" and redeem_code != "SUCCESS":
-            return None, redeem_status.get("message") or "รับซองไม่สำเร็จครับ"
-
-        redeemed_data = redeem_data.get("data", {})
-        ticket = redeemed_data.get("my_ticket") or {}
-        amount_value = ticket.get("amount_baht") or redeemed_data.get("amount_baht") or fallback_amount
-        amount = float(amount_value or 0)
-        if amount <= 0:
-            return None, "รับซองแล้วแต่ยอดที่ได้รับไม่ถูกต้อง กรุณาติดต่อแอดมินครับ"
-        return {"amount": amount, "owner": owner, "code": code}, "ok"
-    except requests.RequestException:
-        return None, "เชื่อมต่อ TrueMoney ไม่สำเร็จ ลองใหม่ภายหลังครับ"
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return None, "อ่านผลจาก TrueMoney ไม่สำเร็จ กรุณาติดต่อแอดมินครับ"
-
-
-async def require_verified(interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("ใช้ร้านได้จากในเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
-        return False
-    if not any(role.id == VERIFIED_ROLE_ID for role in interaction.user.roles):
-        await interaction.response.send_message("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
-        return False
-    return True
-
-
-async def member_is_verified(interaction):
-    return interaction.guild is not None and any(
-        role.id == VERIFIED_ROLE_ID for role in interaction.user.roles
-    )
-
+    return None, "ระบบ TrueMoney ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง หรือติดต่อแอดมินครับ"
 
 def is_admin(interaction):
     if interaction.guild is None:
@@ -2119,68 +2120,124 @@ async def product_price_command(interaction: discord.Interaction, product_id: st
     )
 
 
-async def adjust_customer_credit(interaction, discord_id, amount, reason, delta):
+async def adjust_customer_credit(interaction: discord.Interaction, target: str, amount: float, reason: str, delta: int):
+    # Immediate defer to prevent 3-second timeout ("แอปพลิเคชันไม่ตอบสนอง")
+    await interaction.response.defer(ephemeral=True)
     if not is_admin(interaction):
-        await interaction.response.send_message("คำสั่งนี้ใช้ได้เฉพาะแอดมินครับ", ephemeral=True)
+        await interaction.followup.send("❌ คำสั่งนี้ใช้ได้เฉพาะแอดมินครับ", ephemeral=True)
         return
-    discord_id = discord_id.strip()
-    if not re.fullmatch(r"\d{17,20}", discord_id):
-        await interaction.response.send_message(
-            "Discord ID ต้องเป็นตัวเลข 17–20 หลักครับ", ephemeral=True
+    clean_id = re.sub(r"\D", "", str(target)).strip()
+    if not clean_id or len(clean_id) < 17:
+        await interaction.followup.send(
+            "❌ กรุณาระบุแท็ก @User หรือ Discord ID เป็นตัวเลข 17–20 หลักครับ", ephemeral=True
         )
         return
-    if not math.isfinite(amount) or amount <= 0 or round(amount, 2) != amount:
-        await interaction.response.send_message(
-            "จำนวนเครดิตต้องมากกว่า 0 และใส่ทศนิยมได้ไม่เกิน 2 ตำแหน่งครับ",
-            ephemeral=True,
+    if not math.isfinite(amount) or amount <= 0:
+        await interaction.followup.send(
+            "❌ จำนวนเครดิตต้องมากกว่า 0 บาทครับ", ephemeral=True
         )
         return
-    reason = reason.strip()
-    if not 3 <= len(reason) <= 200:
-        await interaction.response.send_message(
-            "ระบุเหตุผลตั้งแต่ 3 ถึง 200 ตัวอักษรครับ", ephemeral=True
-        )
-        return
-    user_id = int(discord_id)
+    amount = round(amount, 2)
+    default_reason = "แอดมินเติมเครดิต" if delta > 0 else "แอดมินหักเครดิต"
+    reason = (reason.strip() if reason and reason.strip() else default_reason)[:200]
+    user_id = int(clean_id)
     updated = await asyncio.to_thread(
         store.adjust_balance, user_id, interaction.user.id, delta * amount, reason
     )
-    if not updated:
-        await interaction.response.send_message(
-            "ยอดเครดิตปัจจุบันไม่พอสำหรับการหักเครดิตครับ", ephemeral=True
+    if not updated and delta < 0:
+        await interaction.followup.send(
+            "❌ ยอดเครดิตปัจจุบันของลูกค้าไม่พอสำหรับการหักเครดิตครับ", ephemeral=True
         )
         return
     balance = await asyncio.to_thread(get_balance, user_id)
     action = "เติม" if delta > 0 else "หัก"
-    await interaction.response.send_message(
-        f"{action}เครดิต Discord ID `{user_id}` {amount:.2f} บาทแล้ว "
-        f"ยอดคงเหลือ {balance:.2f} บาท\nเหตุผล: {reason}",
+    await interaction.followup.send(
+        f"✅ {action}เครดิตให้ <@{user_id}> (`{user_id}`) จำนวน **`{amount:,.2f} บาท`** สำเร็จ!\n"
+        f"💰 ยอดคงเหลือปัจจุบัน: **`{balance:,.2f} บาท`**\n"
+        f"📝 เหตุผล: `{reason}`",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="credit-add", description="เติมเครดิตให้ลูกค้าด้วย Discord ID (แอดมิน)")
+async def check_customer_credit(interaction: discord.Interaction, target: str):
+    await interaction.response.defer(ephemeral=True)
+    clean_id = re.sub(r"\D", "", str(target)).strip()
+    if not clean_id or len(clean_id) < 17:
+        await interaction.followup.send(
+            "❌ กรุณาระบุแท็ก @User หรือ Discord ID เป็นตัวเลข 17–20 หลักครับ", ephemeral=True
+        )
+        return
+    user_id = int(clean_id)
+    balance = await asyncio.to_thread(get_balance, user_id)
+    await interaction.followup.send(
+        f"💰 ยอดเครดิตของ <@{user_id}> (`{user_id}`): **`{balance:,.2f} บาท`**",
+        ephemeral=True
+    )
+
+
+# --- Slash Command Group: /credit [add | remove | check] ---
+credit_group = discord.app_commands.Group(name="credit", description="จัดการเครดิตลูกค้า (Admin Only)")
+
+
+@credit_group.command(name="add", description="เพิ่มเครดิตเงินบาทให้ลูกค้า (แอดมิน)")
 @discord.app_commands.describe(
-    discord_id="Discord User ID ของลูกค้า",
+    target="แท็กผู้ใช้ (@User) หรือ Discord ID ของลูกค้า",
     amount="จำนวนเครดิตเป็นบาท (ทศนิยมไม่เกิน 2 ตำแหน่ง)",
-    reason="เหตุผล เช่น สลิปผ่านแต่ระบบไม่เติมเครดิต",
+    reason="เหตุผลในการเติมเครดิต (ไม่บังคับ)",
+)
+async def credit_sub_add(
+    interaction: discord.Interaction, target: str, amount: float, reason: str = "แอดมินเติมเครดิต"
+):
+    await adjust_customer_credit(interaction, target, amount, reason, 1)
+
+
+@credit_group.command(name="remove", description="หักเครดิตลูกค้า (แอดมิน)")
+@discord.app_commands.describe(
+    target="แท็กผู้ใช้ (@User) หรือ Discord ID ของลูกค้า",
+    amount="จำนวนเครดิตเป็นบาท (ทศนิยมไม่เกิน 2 ตำแหน่ง)",
+    reason="เหตุผลในการหักเครดิต (ไม่บังคับ)",
+)
+async def credit_sub_remove(
+    interaction: discord.Interaction, target: str, amount: float, reason: str = "แอดมินหักเครดิต"
+):
+    await adjust_customer_credit(interaction, target, amount, reason, -1)
+
+
+@credit_group.command(name="check", description="ตรวจสอบยอดเครดิตคงเหลือของลูกค้า")
+@discord.app_commands.describe(
+    target="แท็กผู้ใช้ (@User) หรือ Discord ID ของลูกค้า",
+)
+async def credit_sub_check(interaction: discord.Interaction, target: str):
+    await check_customer_credit(interaction, target)
+
+
+bot.tree.add_command(credit_group)
+
+
+# --- Standalone Shorthands: /credit-add & /credit-remove ---
+@bot.tree.command(name="credit-add", description="เติมเครดิตให้ลูกค้าด้วย @User หรือ Discord ID (แอดมิน)")
+@discord.app_commands.describe(
+    target="แท็กผู้ใช้ (@User) หรือ Discord ID ของลูกค้า",
+    amount="จำนวนเครดิตเป็นบาท (ทศนิยมไม่เกิน 2 ตำแหน่ง)",
+    reason="เหตุผล เช่น สลิปผ่านแต่ระบบไม่เติมเครดิต (ไม่บังคับ)",
 )
 async def credit_add_command(
-    interaction: discord.Interaction, discord_id: str, amount: float, reason: str
+    interaction: discord.Interaction, target: str, amount: float, reason: str = "แอดมินเติมเครดิต"
 ):
-    await adjust_customer_credit(interaction, discord_id, amount, reason, 1)
+    await adjust_customer_credit(interaction, target, amount, reason, 1)
 
 
-@bot.tree.command(name="credit-remove", description="หักเครดิตลูกค้าด้วย Discord ID (แอดมิน)")
+@bot.tree.command(name="credit-remove", description="หักเครดิตลูกค้าด้วย @User หรือ Discord ID (แอดมิน)")
 @discord.app_commands.describe(
-    discord_id="Discord User ID ของลูกค้า",
+    target="แท็กผู้ใช้ (@User) หรือ Discord ID ของลูกค้า",
     amount="จำนวนเครดิตเป็นบาท (ทศนิยมไม่เกิน 2 ตำแหน่ง)",
-    reason="เหตุผลที่หักเครดิต",
+    reason="เหตุผลที่หักเครดิต (ไม่บังคับ)",
 )
 async def credit_remove_command(
-    interaction: discord.Interaction, discord_id: str, amount: float, reason: str
+    interaction: discord.Interaction, target: str, amount: float, reason: str = "แอดมินหักเครดิต"
 ):
-    await adjust_customer_credit(interaction, discord_id, amount, reason, -1)
+    await adjust_customer_credit(interaction, target, amount, reason, -1)
+
 
 
 # --- Script Search / Scriptblox Integration ---
