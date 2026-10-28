@@ -1259,8 +1259,8 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
 
         symbol = "LTC" if "LTC" in asset_id else "USDT"
         self.amount_input = discord.ui.TextInput(
-            label=f"จำนวนเหรียญ {symbol} ที่ต้องการให้โอน",
-            placeholder=f"ระบุยอด {symbol} เช่น 5, 10, 25 (หรือใส่ 200B เพื่อระบุเป็นบาท)",
+            label=f"ระบุยอดเงิน (บาท) หรือยอดเหรียญ ({symbol})",
+            placeholder=f"ใส่ยอดบาท เช่น 50, 100 หรือระบุเหรียญ เช่น 0.05 หรือพิมพ์ all เพื่อแลกหมด",
             style=discord.TextStyle.short,
             required=True,
             custom_id="input_amount",
@@ -1276,16 +1276,46 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
         rate = ltc_rate if "LTC" in self.asset_id else usdt_rate
         symbol = "LTC" if "LTC" in self.asset_id else "USDT"
 
-        try:
-            if amt_str.endswith("B") or amt_str.endswith("THB") or amt_str.endswith("บาท"):
-                thb_req = float(re.sub(r"[^0-9.]", "", amt_str))
-                crypto_amount = round(thb_req / rate, 4 if "LTC" in self.asset_id else 2)
-            else:
-                crypto_amount = float(re.sub(r"[^0-9.]", "", amt_str))
-                thb_req = round(crypto_amount * rate, 2)
-        except Exception:
-            await interaction.followup.send("❌ รูปแบบจำนวนเหรียญไม่ถูกต้อง กรุณาระบุเป็นตัวเลข เช่น `10` หรือ `350B`", ephemeral=True)
+        bal = await asyncio.to_thread(get_balance, interaction.user.id)
+        if bal <= 0:
+            await interaction.followup.send("❌ คุณไม่มีเครดิตในกระเป๋าครับ กรุณากดปุ่มเติมเครดิตก่อนทำรายการ", ephemeral=True)
             return
+
+        clean_amt = amt_str.replace(",", "").strip()
+        try:
+            if clean_amt.lower() in ("all", "max", "ทั้งหมด", "หมด"):
+                thb_req = bal
+                crypto_amount = round(thb_req / rate, 4 if symbol == "LTC" else 2)
+            elif clean_amt.endswith(("LTC", "USDT", "COIN")):
+                val = float(re.sub(r"[^0-9.]", "", clean_amt))
+                crypto_amount = val
+                thb_req = round(crypto_amount * rate, 2)
+            elif clean_amt.endswith(("B", "THB", "บาท")):
+                thb_req = float(re.sub(r"[^0-9.]", "", clean_amt))
+                crypto_amount = round(thb_req / rate, 4 if symbol == "LTC" else 2)
+            else:
+                val = float(re.sub(r"[^0-9.]", "", clean_amt))
+                if val < 1.0:
+                    crypto_amount = val
+                    thb_req = round(crypto_amount * rate, 2)
+                elif symbol == "LTC":
+                    # For LTC (rate ~2,000 THB), user entering >= 1.0 is specifying THB
+                    thb_req = val
+                    crypto_amount = round(thb_req / rate, 4)
+                elif val <= bal and val * rate > bal:
+                    thb_req = val
+                    crypto_amount = round(thb_req / rate, 2)
+                else:
+                    crypto_amount = val
+                    thb_req = round(crypto_amount * rate, 2)
+        except Exception:
+            await interaction.followup.send("❌ รูปแบบจำนวนเงินไม่ถูกต้อง กรุณาระบุเป็นตัวเลข เช่น `100` หรือ `0.05` หรือ `all`", ephemeral=True)
+            return
+
+        # Micro-rounding buffer: If user is short by <= 2 baht due to live rate fluctuation, auto-fit to their balance
+        if bal < thb_req and (thb_req - bal) <= 2.0:
+            thb_req = bal
+            crypto_amount = round(thb_req / rate, 4 if symbol == "LTC" else 2)
 
         if crypto_amount <= 0 or thb_req <= 0:
             await interaction.followup.send("❌ ยอดเหรียญต้องมากกว่า 0 ครับ", ephemeral=True)
@@ -1294,12 +1324,11 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
         min_crypto = 0.002 if symbol == "LTC" else 2.0
         if crypto_amount < min_crypto:
             await interaction.followup.send(
-                f"❌ ยอดถอนขั้นต่ำของระบบคือ `{min_crypto} {symbol}` (คุณระบุ `{crypto_amount} {symbol}`)",
+                f"❌ ยอดถอนขั้นต่ำของระบบคือ `{min_crypto} {symbol}` (ประมาณ {min_crypto * rate:.2f} บาท) แต่คุณระบุ `{crypto_amount} {symbol}`",
                 ephemeral=True,
             )
             return
 
-        bal = await asyncio.to_thread(get_balance, interaction.user.id)
         if bal < thb_req:
             await interaction.followup.send(
                 f"❌ เครดิตไม่เพียงพอครับ\n"
