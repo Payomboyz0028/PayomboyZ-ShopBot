@@ -112,6 +112,11 @@ def get_balance(user_id):
     return store.get_balance(user_id)
 
 
+def adjust_balance(user_id, admin_id, delta, reason):
+    """Atomic balance adjustment via shop_data store"""
+    return store.adjust_balance(user_id, admin_id, delta, reason)
+
+
 def credit_topup(user_id, amount, payment_ref):
     """Atomic topup processed directly against Supabase Cloud Database"""
     return store.credit_topup(user_id, amount, payment_ref)
@@ -1294,6 +1299,7 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
             usdt_rate, ltc_rate = await fetch_live_crypto_rates()
             rate = ltc_rate if "LTC" in self.asset_id else usdt_rate
             symbol = "LTC" if "LTC" in self.asset_id else "USDT"
+            example_amt = "0.01897495" if symbol == "LTC" else "6"
 
             bal = await asyncio.to_thread(get_balance, interaction.user.id)
             if bal <= 0:
@@ -1343,7 +1349,7 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
 
             # Deduct user balance atomically
             deducted = await asyncio.to_thread(
-                adjust_balance, interaction.user.id, 0, -thb_req, f"Crypto exchange: {crypto_amount} {symbol} ({self.network}) to {addr}"
+                store.adjust_balance, interaction.user.id, 0, -thb_req, f"Crypto exchange: {crypto_amount} {symbol} ({self.network}) to {addr}"
             )
             if not deducted:
                 await interaction.followup.send("❌ เกิดข้อผิดพลาดในการหักเครดิต กรุณาลองใหม่อีกครั้ง", ephemeral=True)
@@ -1437,7 +1443,7 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
                 # Payout failed -> 100% REFUND
                 print(f"[Crypto Payout Error] Order failed for user {interaction.user.id}: {e}")
                 await asyncio.to_thread(
-                    adjust_balance, interaction.user.id, 0, thb_req, f"Refund failed crypto payout: {e}"
+                    store.adjust_balance, interaction.user.id, 0, thb_req, f"Refund failed crypto payout: {e}"
                 )
 
                 fail_embed = discord.Embed(
