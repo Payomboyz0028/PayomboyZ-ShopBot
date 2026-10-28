@@ -133,7 +133,7 @@ def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tupl
         time.sleep(2.5)
         try:
             poll_ts = int(time.time() * 1000)
-            hist_q = f"coin={coin}&withdrawOrderId={withdraw_id}&timestamp={poll_ts}"
+            hist_q = f"coin={coin}&timestamp={poll_ts}"
             hist_sig = sign_query(hist_q)
             r_hist = requests.get(f"{BASE_URL}/sapi/v1/capital/withdraw/history?{hist_q}&signature={hist_sig}", headers=headers, timeout=5)
             if r_hist.status_code == 200:
