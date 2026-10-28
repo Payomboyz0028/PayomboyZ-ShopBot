@@ -1259,10 +1259,10 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
         self.add_item(self.address_input)
 
         symbol = "LTC" if "LTC" in asset_id else "USDT"
-        example_amt = "0.01897495" if symbol == "LTC" else "15"
+        example_amt = "0.01897495" if symbol == "LTC" else "6"
         self.amount_input = discord.ui.TextInput(
             label=f"จำนวนเหรียญ {symbol} ที่ต้องการแลก",
-            placeholder=f"เช่น {example_amt} หรือพิมพ์ all เพื่อแลกทั้งหมด",
+            placeholder=f"ระบุจำนวนเหรียญ เช่น {example_amt} (หรือพิมพ์ all เพื่อแลกหมด)",
             style=discord.TextStyle.short,
             required=True,
             custom_id="input_amount",
@@ -1302,19 +1302,14 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
 
             clean_amt = amt_str.replace(",", "").strip()
 
-            # Parse amount: DEFAULT IS THE CRYPTO AMOUNT DIRECTLY!
+            # Amount is strictly coin amount (or all to swap max balance)
             if clean_amt.lower() in ("all", "max", "ทั้งหมด", "หมด"):
                 thb_req = bal
                 crypto_amount = round(thb_req / rate, 8 if symbol == "LTC" else 4)
-            elif clean_amt.endswith(("B", "THB", "บาท")):
-                # Explicitly specified in Thai Baht
-                thb_req = float(re.sub(r"[^0-9.]", "", clean_amt))
-                crypto_amount = round(thb_req / rate, 8 if symbol == "LTC" else 4)
             else:
-                # Direct crypto amount entered (e.g. 0.01897495, 0.05, 10, 15.5)
                 clean_num = re.sub(r"[^0-9.]", "", clean_amt)
                 if not clean_num:
-                    await interaction.followup.send("❌ กรุณาระบุจำนวนเหรียญเป็นตัวเลข เช่น `0.01897495` หรือ `all`", ephemeral=True)
+                    await interaction.followup.send(f"❌ กรุณาระบุจำนวนเหรียญ {symbol} เป็นตัวเลข เช่น `{example_amt}`", ephemeral=True)
                     return
                 crypto_amount = float(clean_num)
                 thb_req = round(crypto_amount * rate, 2)

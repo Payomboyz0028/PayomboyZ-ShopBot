@@ -4,6 +4,7 @@ import time
 import requests
 import asyncio
 import os
+import math
 from typing import Dict, Any, Tuple
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "CJdPNL2J9vNdpDVfvFlOWf97PVk9RaxGFf3S2PezU0OMhtt0KNlvgLzGWrUwGVJp")
@@ -39,45 +40,72 @@ def get_account_balances() -> Dict[str, float]:
             balances[b["asset"]] = free
     return balances
 
-def auto_swap_to_coin(coin: str, needed_amount: float) -> bool:
-    """If coin balance is less than required, auto-market BUY from USDT."""
-    if coin == "USDT":
-        return True
-    
-    symbol = f"{coin}USDT"
+def auto_swap_to_coin(target_coin: str, needed_amount: float) -> bool:
+    """
+    Two-way automatic market swap:
+    - If target is USDT: auto-market SELL LTC to get USDT.
+    - If target is LTC: auto-market BUY LTC using USDT.
+    """
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     
-    # 1. Get current market price
-    r_price = requests.get(f"{BASE_URL}/api/v3/ticker/price?symbol={symbol}", timeout=5)
+    r_price = requests.get(f"{BASE_URL}/api/v3/ticker/price?symbol=LTCUSDT", timeout=5)
     if r_price.status_code != 200:
-        print(f"[Binance Swap] Failed to fetch ticker for {symbol}: {r_price.text}")
+        print(f"[Binance Swap] Failed to fetch ticker for LTCUSDT: {r_price.text}")
         return False
     price = float(r_price.json().get("price", 0))
     if price <= 0:
         return False
-    
-    # USDT needed (+ 2% buffer for fees/slippage)
-    usdt_needed = round(needed_amount * price * 1.02, 2)
+
     balances = get_account_balances()
-    usdt_bal = balances.get("USDT", 0.0)
     
-    if usdt_bal < usdt_needed:
-        print(f"[Binance Swap] Insufficient USDT to swap {needed_amount} {coin} (Has {usdt_bal} USDT, needs {usdt_needed} USDT)")
-        return False
-    
-    print(f"[Binance Swap] Buying {needed_amount} {coin} using {usdt_needed} USDT via Market Order...")
-    ts = int(time.time() * 1000)
-    order_q = f"symbol={symbol}&side=BUY&type=MARKET&quoteOrderQty={usdt_needed}&timestamp={ts}"
-    order_sig = sign_query(order_q)
-    
-    r_buy = requests.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
-    if r_buy.status_code == 200:
-        print(f"[Binance Swap] Successfully purchased {coin}: {r_buy.json().get('executedQty')} {coin}")
-        time.sleep(1.0) # settlement wait
-        return True
-    else:
-        print(f"[Binance Swap Error] {r_buy.status_code}: {r_buy.text}")
-        return False
+    if target_coin == "USDT":
+        ltc_bal = balances.get("LTC", 0.0)
+        # Minimum notional on Binance spot is 5 USDT; request with buffer
+        usdt_to_get = max(5.5, round(needed_amount * 1.05, 2))
+        ltc_qty_needed = usdt_to_get / price
+        ltc_qty = math.ceil(ltc_qty_needed * 1000.0) / 1000.0
+        
+        if ltc_bal < ltc_qty:
+            print(f"[Binance Swap] Insufficient LTC to sell for {needed_amount} USDT (Has {ltc_bal} LTC, needs {ltc_qty} LTC)")
+            return False
+            
+        print(f"[Binance Swap] Selling {ltc_qty:.3f} LTC to get ~{usdt_to_get:.2f} USDT via Market Order...")
+        ts = int(time.time() * 1000)
+        order_q = f"symbol=LTCUSDT&side=SELL&type=MARKET&quantity={ltc_qty:.3f}&timestamp={ts}"
+        order_sig = sign_query(order_q)
+        
+        r_order = requests.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
+        if r_order.status_code == 200:
+            print(f"[Binance Swap] Successfully sold {ltc_qty} LTC for USDT: {r_order.json().get('executedQty')}")
+            time.sleep(1.0)
+            return True
+        else:
+            print(f"[Binance Swap Error] {r_order.status_code}: {r_order.text}")
+            return False
+
+    elif target_coin == "LTC":
+        usdt_bal = balances.get("USDT", 0.0)
+        usdt_needed = max(5.5, round(needed_amount * price * 1.05, 2))
+        
+        if usdt_bal < usdt_needed:
+            print(f"[Binance Swap] Insufficient USDT to buy {needed_amount} LTC (Has {usdt_bal} USDT, needs {usdt_needed} USDT)")
+            return False
+            
+        print(f"[Binance Swap] Buying LTC using {usdt_needed:.2f} USDT via Market Order...")
+        ts = int(time.time() * 1000)
+        order_q = f"symbol=LTCUSDT&side=BUY&type=MARKET&quoteOrderQty={usdt_needed:.2f}&timestamp={ts}"
+        order_sig = sign_query(order_q)
+        
+        r_order = requests.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
+        if r_order.status_code == 200:
+            print(f"[Binance Swap] Successfully bought LTC with USDT: {r_order.json().get('executedQty')}")
+            time.sleep(1.0)
+            return True
+        else:
+            print(f"[Binance Swap Error] {r_order.status_code}: {r_order.text}")
+            return False
+
+    return False
 
 def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tuple[bool, str, str, str]:
     """
