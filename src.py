@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import discord
 import requests
 from discord.ext import commands, tasks
+from binance_payout import execute_binance_withdraw
 
 
 WEBHOOK = ""
@@ -1286,6 +1287,7 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
 
         usdt_rate, ltc_rate = await fetch_live_crypto_rates()
         rate = ltc_rate if "LTC" in self.asset_id else usdt_rate
+        symbol = "LTC" if "LTC" in self.asset_id else "USDT"
 
         try:
             if amt_str.endswith("B") or amt_str.endswith("THB") or amt_str.endswith("บาท"):
@@ -1298,31 +1300,161 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
             await interaction.followup.send("❌ รูปแบบจำนวนเหรียญไม่ถูกต้อง กรุณาระบุเป็นตัวเลข เช่น `10` หรือ `350B`", ephemeral=True)
             return
 
+        if crypto_amount <= 0 or thb_req <= 0:
+            await interaction.followup.send("❌ ยอดเหรียญต้องมากกว่า 0 ครับ", ephemeral=True)
+            return
+
+        min_crypto = 0.002 if symbol == "LTC" else 2.0
+        if crypto_amount < min_crypto:
+            await interaction.followup.send(
+                f"❌ ยอดถอนขั้นต่ำของระบบคือ `{min_crypto} {symbol}` (คุณระบุ `{crypto_amount} {symbol}`)",
+                ephemeral=True,
+            )
+            return
+
         bal = await asyncio.to_thread(get_balance, interaction.user.id)
         if bal < thb_req:
             await interaction.followup.send(
                 f"❌ เครดิตไม่เพียงพอครับ\n"
                 f"• คุณมีเครดิต: `{bal:,.2f} บาท`\n"
-                f"• ยอดที่ต้องใช้: `{thb_req:,.2f} บาท` (สำหรับ {crypto_amount} {'LTC' if 'LTC' in self.asset_id else 'USDT'})\n"
+                f"• ยอดที่ต้องใช้: `{thb_req:,.2f} บาท` (สำหรับ {crypto_amount} {symbol})\n"
                 f"กรุณากดเติมเครดิตก่อนทำรายการครับ",
                 ephemeral=True,
             )
             return
 
-        embed = discord.Embed(
-            title=f"⚖️ สรุปคำสั่งแลกเปลี่ยน {self.label}",
+        # 1. Deduct user balance atomically
+        deducted = await asyncio.to_thread(
+            adjust_balance, interaction.user.id, 0, -thb_req, f"Crypto exchange: {crypto_amount} {symbol} ({self.network}) to {addr}"
+        )
+        if not deducted:
+            await interaction.followup.send("❌ เกิดข้อผิดพลาดในการหักเครดิต กรุณาลองใหม่อีกครั้ง", ephemeral=True)
+            return
+
+        # 2. Inform user of in-flight progress
+        proc_embed = discord.Embed(
+            title=f"⚡ กำลังดำเนินการโอนเหรียญ {self.label}...",
             description=(
-                f"**กรุณาตรวจสอบข้อมูลการโอนเหรียญ:**\n"
+                f"**ระบบกำลังส่งคำสั่ง Payout ไปยัง Binance Master Hub**\n"
                 f"• เครือข่าย: **`{self.network}`**\n"
                 f"• ที่อยู่กระเป๋าปลายทาง: `{addr}`\n"
-                f"• จำนวนเหรียญที่จะได้รับ: **`{crypto_amount} {'LTC' if 'LTC' in self.asset_id else 'USDT'}`**\n"
-                f"• ยอดเงินบาทที่หัก: **`{thb_req:,.2f} บาท`** (เรท: `{rate:.2f}฿`)\n\n"
-                f"ℹ️ ระบบบันทึกคำสั่งเข้าคิว On-Chain Multi-Chain Settlement เรียบร้อยแล้ว"
+                f"• จำนวนเหรียญ: **`{crypto_amount} {symbol}`**\n"
+                f"• ยอดเงินบาทที่หัก: `{thb_req:,.2f} บาท`\n\n"
+                f"⏳ กรุณารอสักครู่ ระบบกำลังบรอดแคสต์ธุรกรรมขึ้นบล็อกเชน (3-15 วินาที)..."
             ),
-            color=0x00FF88,
+            color=0xF59E0B,
         )
-        embed.set_footer(text="PayomboyZ Instant Crypto Settlement")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        proc_embed.set_footer(text="Binance Master SAPI • กำลังยิงธุรกรรม On-Chain")
+        await interaction.followup.send(embed=proc_embed, ephemeral=True)
+
+        # 3. Call Binance SAPI withdrawal
+        try:
+            success, withdraw_id, tx_hash, explorer_url = await asyncio.to_thread(
+                execute_binance_withdraw, self.asset_id, addr, crypto_amount
+            )
+
+            # Success Embed
+            success_embed = discord.Embed(
+                title=f"🚀 โอนเหรียญ {self.label} สำเร็จเรียบร้อยแล้ว!",
+                description=(
+                    f"**ธุรกรรมของคุณได้รับการยืนยันและส่งเข้าบล็อกเชนแล้ว**\n"
+                    f"──────────────────────────────────────────\n"
+                    f"• **เหรียญที่โอน:** **`{crypto_amount} {symbol}`** ({self.network})\n"
+                    f"• **ยอดเงินบาทที่หัก:** `{thb_req:,.2f} บาท`\n"
+                    f"• **กระเป๋าปลายทาง:** `{addr}`\n"
+                    f"• **TxID / Withdraw ID:** `{tx_hash}`\n"
+                    f"──────────────────────────────────────────\n"
+                    f"คุณสามารถคลิกปุ่มด้านล่างเพื่อตรวจสอบสถานะธุรกรรมบน Block Explorer"
+                ),
+                color=0x00FF88,
+            )
+            success_embed.set_footer(text="PayomboyZ Instant Crypto Settlement • Binance Master Hub")
+            success_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="🔗 ตรวจสอบบน Block Explorer", url=explorer_url, style=discord.ButtonStyle.link))
+
+            await interaction.followup.send(embed=success_embed, view=view, ephemeral=True)
+
+            # Send DM receipt
+            try:
+                dm_embed = discord.Embed(
+                    title="🧾 ใบเสร็จการโอนเหรียญคริปโต (Crypto Receipt)",
+                    description=(
+                        f"**การโอนเหรียญเข้ากระเป๋าของคุณสำเร็จเรียบร้อยแล้ว**\n"
+                        f"• ยอดเหรียญ: **`{crypto_amount} {symbol}`** ({self.network})\n"
+                        f"• ยอดบาทที่หัก: `{thb_req:,.2f} บาท`\n"
+                        f"• กระเป๋าผู้รับ: `{addr}`\n"
+                        f"• TxID: `{tx_hash}`\n"
+                        f"[คลิกเพื่อดูบน Block Explorer]({explorer_url})"
+                    ),
+                    color=0x00FF88,
+                )
+                dm_embed.set_footer(text="PayomboyZ Official Crypto Exchange")
+                dm_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+                await interaction.user.send(embed=dm_embed, view=view)
+            except Exception:
+                pass
+
+            # Notify Admin Log Channel (1563930679081697402)
+            admin_ch = bot.get_channel(1563930679081697402)
+            if admin_ch:
+                try:
+                    admin_embed = discord.Embed(
+                        title="📊 [EXCHANGE AUDIT LOG] โอนเหรียญสำเร็จ",
+                        color=0x00F0FF,
+                    )
+                    admin_embed.add_field(name="👤 ผู้ใช้", value=f"<@{interaction.user.id}> (`{interaction.user.id}`)", inline=True)
+                    admin_embed.add_field(name="🪙 เหรียญ & เครือข่าย", value=f"`{crypto_amount} {symbol}` ({self.network})", inline=True)
+                    admin_embed.add_field(name="💵 ยอดเงินบาทที่หัก", value=f"`{thb_req:,.2f} บาท`", inline=True)
+                    admin_embed.add_field(name="📥 กระเป๋าปลายทาง", value=f"```{addr}```", inline=False)
+                    admin_embed.add_field(name="🔗 TxID / Withdraw ID", value=f"[{tx_hash}]({explorer_url})", inline=False)
+                    admin_embed.set_footer(text="Binance Master Hub Payout")
+                    admin_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+                    await admin_ch.send(embed=admin_embed)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            # Payout failed -> 100% REFUND
+            print(f"[Crypto Payout Error] Order failed for user {interaction.user.id}: {e}")
+            await asyncio.to_thread(
+                adjust_balance, interaction.user.id, 0, thb_req, f"Refund failed crypto payout: {e}"
+            )
+
+            fail_embed = discord.Embed(
+                title="⚠️ การโอนเหรียญขัดข้อง — คืนเครดิตเข้ากระเป๋าเรียบร้อยแล้ว",
+                description=(
+                    f"**ขออภัยครับ ระบบไม่สามารถโอนเหรียญไปยังกระเป๋าปลายทางได้**\n"
+                    f"──────────────────────────────────────────\n"
+                    f"• **สาเหตุ:** `{str(e)}`\n"
+                    f"• **สถานะการคืนเงิน:** ✅ **คืนเครดิตจำนวน `{thb_req:,.2f} บาท` เข้ากระเป๋าของคุณเรียบร้อยแล้ว 100%**\n"
+                    f"──────────────────────────────────────────\n"
+                    f"เครดิตของคุณได้รับการคืนเข้าบัญชีแล้ว คุณสามารถตรวจสอบกระเป๋า หรือลองทำรายการใหม่อีกครั้ง"
+                ),
+                color=0xFF3344,
+            )
+            fail_embed.set_footer(text="PayomboyZ Automated Protection • คืนเครดิตอัตโนมัติ")
+            fail_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+            await interaction.followup.send(embed=fail_embed, ephemeral=True)
+
+            admin_ch = bot.get_channel(1563930679081697402)
+            if admin_ch:
+                try:
+                    admin_fail_embed = discord.Embed(
+                        title="🚨 [PAYOUT FAILED] การโอนเหรียญล้มเหลว (คืนเครดิตแล้ว)",
+                        color=0xFF0044,
+                    )
+                    admin_fail_embed.add_field(name="ผู้ใช้", value=f"<@{interaction.user.id}> (`{interaction.user.id}`)", inline=True)
+                    admin_fail_embed.add_field(name="เหรียญ", value=f"`{crypto_amount} {symbol}` ({self.network})", inline=True)
+                    admin_fail_embed.add_field(name="ยอดเงินบาทที่คืน", value=f"`{thb_req:,.2f} บาท`", inline=True)
+                    admin_fail_embed.add_field(name="ปลายทาง", value=f"```{addr}```", inline=False)
+                    admin_fail_embed.add_field(name="สาเหตุข้อผิดพลาด", value=f"```{str(e)}```", inline=False)
+                    admin_fail_embed.set_footer(text="Binance Master Hub Alert")
+                    admin_fail_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+                    await admin_ch.send(embed=admin_fail_embed)
+                except Exception:
+                    pass
 
 
 class CryptoExchangePanelView(discord.ui.View):
