@@ -423,32 +423,19 @@ def redeem_truemoney(link, phone):
     return None, "ระบบ TrueMoney ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง หรือติดต่อแอดมินครับ"
 
 async def member_is_verified(interaction):
-    """Check if member has verified role or server doesn't enforce one."""
+    """Allow all server members to interact with shop and check balances."""
     if interaction.guild is None:
         return False
-    if not VERIFIED_ROLE_ID:
-        return True
-    # If the configured verified role exists in guild, verify user has it
-    guild_has_role = any(r.id == VERIFIED_ROLE_ID for r in interaction.guild.roles)
-    if not guild_has_role:
-        return True
-    return any(role.id == VERIFIED_ROLE_ID for role in getattr(interaction.user, "roles", ()))
+    return True
 
 
 async def require_verified(interaction):
-    """Ensure member is verified before interacting with shop items."""
+    """Ensure member is in guild before interacting with shop items."""
     if interaction.guild is None:
         if not interaction.response.is_done():
             await interaction.response.send_message("ใช้ร้านได้จากในเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
         else:
             await interaction.followup.send("ใช้ร้านได้จากในเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
-        return False
-    verified = await member_is_verified(interaction)
-    if not verified:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
-        else:
-            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
         return False
     return True
 
@@ -696,7 +683,7 @@ class SlipUploadModal(discord.ui.Modal):
 
 class SlipUploadView(discord.ui.View):
     def __init__(self, expected_amount=None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.expected_amount = expected_amount
 
     @discord.ui.button(label="แนบสลิปเพื่อตรวจสอบ", emoji="🧾", style=discord.ButtonStyle.success)
@@ -741,7 +728,7 @@ class PromptPayAmountModal(discord.ui.Modal, title="ระบุยอดเง�
 
 class LockedQRView(discord.ui.View):
     def __init__(self, amount: float):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.amount = amount
 
     @discord.ui.button(
@@ -988,7 +975,7 @@ def verify_onchain_bsc_tx(tx_hash: str, receiving_wallet: str = "0xc7dd6ed5b2a79
 
 class TopupMethodView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.promptpay_locked.emoji = resolve_button_emoji("emoji_16", "📱")
         self.bank_transfer.emoji = resolve_button_emoji("SCB", "🏦")
         self.truemoney.emoji = resolve_button_emoji("Truemoney", "💚")
@@ -1197,7 +1184,7 @@ class CryptoTxidModal(discord.ui.Modal, title="⚡ ยืนยันราย�
 
 class CryptoDepositActionView(discord.ui.View):
     def __init__(self, rate: float):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.rate = rate
 
     @discord.ui.button(
@@ -1621,7 +1608,7 @@ class CryptoExchangePanelView(discord.ui.View):
 
 class InsufficientCreditView(discord.ui.View):
     def __init__(self, shortage: float):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.shortage = shortage
 
     @discord.ui.button(
@@ -1934,7 +1921,7 @@ class KeyProductSelect(discord.ui.Select):
 
 class KeyAdminView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
         self.add_item(KeyProductSelect("add", 0))
         self.add_item(KeyProductSelect("remove", 1))
 
@@ -2614,12 +2601,6 @@ async def on_ready():
         print("Bot needs permission to post or edit the shop panel")
 
 
-if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("ตั้งค่า DISCORD_BOT_TOKEN ในไฟล์ .env ก่อนเริ่มบอท")
-    bot.run(TOKEN)
-
-
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore messages from bots
@@ -2682,3 +2663,11 @@ async def on_message(message: discord.Message):
             return
 
     await bot.process_commands(message)
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("ตั้งค่า DISCORD_BOT_TOKEN ในไฟล์ .env ก่อนเริ่มบอท")
+    bot.run(TOKEN)
+
+
