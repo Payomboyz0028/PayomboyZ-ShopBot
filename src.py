@@ -421,6 +421,37 @@ def redeem_truemoney(link, phone):
 
     return None, "ระบบ TrueMoney ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง หรือติดต่อแอดมินครับ"
 
+async def member_is_verified(interaction):
+    """Check if member has verified role or server doesn't enforce one."""
+    if interaction.guild is None:
+        return False
+    if not VERIFIED_ROLE_ID:
+        return True
+    # If the configured verified role exists in guild, verify user has it
+    guild_has_role = any(r.id == VERIFIED_ROLE_ID for r in interaction.guild.roles)
+    if not guild_has_role:
+        return True
+    return any(role.id == VERIFIED_ROLE_ID for role in getattr(interaction.user, "roles", ()))
+
+
+async def require_verified(interaction):
+    """Ensure member is verified before interacting with shop items."""
+    if interaction.guild is None:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("ใช้ร้านได้จากในเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
+        else:
+            await interaction.followup.send("ใช้ร้านได้จากในเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
+        return False
+    verified = await member_is_verified(interaction)
+    if not verified:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
+        else:
+            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
+        return False
+    return True
+
+
 def is_admin(interaction):
     if interaction.guild is None:
         return False
@@ -531,7 +562,8 @@ async def credit_topup_and_reply(interaction, amount, payment_ref, method, legac
         saved = await asyncio.to_thread(
             credit_topup, interaction.user.id, amount, payment_ref
         )
-    except sqlite3.Error:
+    except Exception as e:
+        print(f'[credit_topup error] {e}')
         print(
             f"CRITICAL: payment received but database credit failed; "
             f"method={method}, user_id={interaction.user.id}"
@@ -567,53 +599,74 @@ async def credit_topup_and_reply(interaction, amount, payment_ref, method, legac
 
 async def process_slip_topup(interaction, slip, expected_amount=None):
     if interaction.guild is None:
-        await interaction.response.send_message(
-            "กรุณาเติมเครดิตจากแผงร้านในเซิร์ฟเวอร์ครับ", ephemeral=True
-        )
-        return
-    if slip.size > 4 * 1024 * 1024:
-        await interaction.response.send_message(
-            "ไฟล์สลิปต้องมีขนาดไม่เกิน 4 MB ครับ", ephemeral=True
-        )
-        return
-    allowed_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-    if slip.content_type not in allowed_types:
-        await interaction.response.send_message(
-            "แนบสลิปเป็น JPG, PNG, GIF หรือ WEBP เท่านั้นครับ", ephemeral=True
-        )
+        msg = "กรุณาเติมเครดิตจากแผงร้านในเซิร์ฟเวอร์ครับ"
+        if not interaction.response.is_done():
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    # Flexible size check
+    slip_size = getattr(slip, "size", 0)
+    if slip_size > 6 * 1024 * 1024:
+        msg = "ไฟล์สลิปต้องมีขนาดไม่เกิน 6 MB ครับ"
+        if not interaction.response.is_done():
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    ct = (getattr(slip, "content_type", "") or "").lower()
+    fn = (getattr(slip, "filename", "") or "").lower()
+    is_img = any(ct.startswith(x) for x in ["image/", "application/octet-stream"]) or any(fn.endswith(x) for x in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"])
+    if not is_img:
+        msg = "กรุณาแนบสลิปเป็นรูปภาพ (JPG, PNG, WEBP) ครับ"
+        if not interaction.response.is_done():
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+        return
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
     try:
         image_bytes = await slip.read()
-    except discord.HTTPException:
-        await interaction.followup.send(
-            "ดาวน์โหลดรูปสลิปไม่สำเร็จ ลองส่งใหม่ครับ", ephemeral=True
-        )
+    except Exception as e:
+        await interaction.followup.send(f"ดาวน์โหลดรูปสลิปไม่สำเร็จ: {e}", ephemeral=True)
         return
 
-    result, status = await asyncio.to_thread(
-        verify_easyslip,
-        image_bytes,
-        slip.filename,
-        slip.content_type,
-        interaction.user.id,
-    )
+    try:
+        result, status = await asyncio.to_thread(
+            verify_easyslip,
+            image_bytes,
+            getattr(slip, "filename", "slip.jpg"),
+            ct or "image/jpeg",
+            interaction.user.id,
+        )
+    except Exception as e:
+        print(f"[EasySlip Verification Exception] {e}")
+        await interaction.followup.send(f"❌ ระบบตรวจสลิปขัดข้องชั่วคราว: {e}", ephemeral=True)
+        return
+
     if status != "ok":
         await interaction.followup.send(f"❌ ตรวจสลิปไม่ผ่าน: {status}", ephemeral=True)
         return
 
     reference = str(result["payment_ref"])
     payment_ref = f"bank:{reference}"
-    await credit_topup_and_reply(
-        interaction,
-        result["amount"],
-        payment_ref,
-        "bank_slip",
-        legacy_ref=reference,
-        expected_amount=expected_amount,
-    )
-
+    try:
+        await credit_topup_and_reply(
+            interaction,
+            result["amount"],
+            payment_ref,
+            "bank_slip",
+            legacy_ref=reference,
+            expected_amount=expected_amount,
+        )
+    except Exception as e:
+        print(f"[Credit Topup Exception] {e}")
+        await interaction.followup.send(f"⚠️ ยอดเงินเข้าแล้วแต่เกิดข้อผิดพลาดในการบันทึกเครดิต: {e}", ephemeral=True)
 
 class SlipUploadModal(discord.ui.Modal):
     def __init__(self, expected_amount=None):
@@ -2433,3 +2486,67 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("ตั้งค่า DISCORD_BOT_TOKEN ในไฟล์ .env ก่อนเริ่มบอท")
     bot.run(TOKEN)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore messages from bots
+    if message.author.bot:
+        return
+
+    # Check if message is in shop channel and has attachments
+    if SHOP_CHANNEL and message.channel.id == SHOP_CHANNEL and message.attachments:
+        slip = message.attachments[0]
+        ct = (getattr(slip, "content_type", "") or "").lower()
+        fn = (getattr(slip, "filename", "") or "").lower()
+        is_img = any(ct.startswith(x) for x in ["image/", "application/octet-stream"]) or any(fn.endswith(x) for x in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"])
+        
+        if is_img:
+            status_msg = await message.reply("⏳ กำลังตรวจสอบสลิปโอนเงินอัตโนมัติ กรุณารอสักครู่...", mention_author=True)
+            try:
+                image_bytes = await slip.read()
+                result, status = await asyncio.to_thread(
+                    verify_easyslip,
+                    image_bytes,
+                    slip.filename,
+                    ct or "image/jpeg",
+                    message.author.id,
+                )
+                if status != "ok":
+                    await status_msg.edit(content=f"❌ ตรวจสลิปไม่ผ่าน: {status}")
+                    return
+
+                reference = str(result["payment_ref"])
+                payment_ref = f"bank:{reference}"
+
+                # Idempotency check
+                if await asyncio.to_thread(store.topup_exists, payment_ref):
+                    await status_msg.edit(content="⚠️ สลิปนี้ถูกใช้งานเติมเครดิตในระบบไปแล้วครับ")
+                    return
+
+                # Credit user
+                saved = await asyncio.to_thread(credit_topup, message.author.id, result["amount"], payment_ref)
+                if not saved:
+                    await status_msg.edit(content="⚠️ รายการชำระเงินนี้ถูกบันทึกไปแล้วครับ")
+                    return
+
+                new_bal = await asyncio.to_thread(get_balance, message.author.id)
+                desc_lines = [
+                    f"👤 ผู้ใช้: <@{message.author.id}>",
+                    f"💵 **ได้รับเครดิต:** `+{result['amount']:,.2f} บาท`",
+                    f"💰 **ยอดเครดิตคงเหลือ:** `{new_bal:,.2f} บาท`",
+                    f"🧾 เลขอ้างอิง: `{reference}`"
+                ]
+                embed = discord.Embed(
+                    title="🎉 เติมเครดิตสำเร็จ!",
+                    description=chr(10).join(desc_lines),
+                    color=0x2ECC71
+                )
+                embed.set_footer(text="PAYOMBØYZ Auto Slip Engine • 24/7 Verified")
+                await status_msg.edit(content=f"✅ <@{message.author.id}> เติมเงินสำเร็จเรียบร้อยครับ!", embed=embed)
+            except Exception as exc:
+                print(f"[Auto Slip Message Handler Error] {exc}")
+                await status_msg.edit(content=f"⚠️ เกิดข้อผิดพลาดในการตรวจสอบสลิป: {exc}")
+            return
+
+    await bot.process_commands(message)
