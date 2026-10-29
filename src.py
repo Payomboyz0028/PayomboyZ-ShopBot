@@ -16,6 +16,7 @@ import discord
 import requests
 from discord.ext import commands, tasks
 from binance_payout import execute_binance_withdraw
+from receipt_generator import generate_crypto_receipt
 
 
 WEBHOOK = ""
@@ -1401,25 +1402,65 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
 
                 await interaction.followup.send(embed=success_embed, view=view, ephemeral=True)
 
-                # Send DM receipt
+                # Generate Luxury Cyberpunk Red/Gold Receipt Image
+                receipt_file = None
+                admin_file = None
+                receipt_bytes = None
+                order_id_str = str(withdraw_id or interaction.id)
+                receipt_filename = f"receipt_{order_id_str[:8]}.png"
+                bangkok_tz = datetime.timezone(datetime.timedelta(hours=7))
+                date_now_str = datetime.datetime.now(bangkok_tz).strftime("%d/%m/%Y %H:%M:%S")
+
+                try:
+                    rate_calc = float(thb_req / crypto_amount) if crypto_amount > 0 else 0.0
+                    receipt_data = {
+                        "order_id": order_id_str,
+                        "symbol": symbol,
+                        "crypto_amount": str(crypto_amount),
+                        "network": f"{self.network} ({symbol})",
+                        "thb_amount": float(thb_req),
+                        "effective_rate": rate_calc,
+                        "network_fee_thb": 5.0,
+                        "recipient_address": addr,
+                        "tx_hash": tx_hash,
+                        "explorer_url": explorer_url,
+                        "date_str": date_now_str
+                    }
+                    receipt_bytes = generate_crypto_receipt(receipt_data)
+                    receipt_file = discord.File(BytesIO(receipt_bytes), filename=receipt_filename)
+                except Exception as rec_err:
+                    print(f"[Receipt Gen Error] {rec_err}")
+
+                # Send DM receipt with Attached Red/Gold Cyberpunk Image
                 try:
                     dm_embed = discord.Embed(
-                        title="🧾 ใบเสร็จการโอนเหรียญคริปโต (Crypto Receipt)",
+                        title="🧾 ใบเสร็จการโอนเหรียญคริปโต (Official Crypto Receipt)",
                         description=(
-                            f"**การโอนเหรียญเข้ากระเป๋าของคุณสำเร็จเรียบร้อยแล้ว**\n"
-                            f"• ยอดเหรียญ: **`{crypto_amount} {symbol}`** ({self.network})\n"
-                            f"• ยอดบาทที่หัก: `{thb_req:,.2f} บาท`\n"
-                            f"• กระเป๋าผู้รับ: `{addr}`\n"
-                            f"• TxID: `{tx_hash}`\n"
-                            f"[คลิกเพื่อดูบน Block Explorer]({explorer_url})"
+                            f"**ธุรกรรมบล็อกเชนของคุณได้รับการยืนยันเรียบร้อยแล้ว**\n"
+                            f"─────────────────────────────────\n"
+                            f"• **รหัสออเดอร์:** `{order_id_str}`\n"
+                            f"• **เหรียญที่โอน:** **`{crypto_amount} {symbol}`** ({self.network})\n"
+                            f"• **ยอดบาทที่หัก:** `{thb_req:,.2f} บาท` (ค่าแก๊ส 5.00 บาท)\n"
+                            f"• **กระเป๋าปลายทาง:** `{addr}`\n"
+                            f"• **TxID:** `{tx_hash}`\n"
+                            f"─────────────────────────────────\n"
+                            f"คุณสามารถเก็บไฟล์รูปภาพใบเสร็จด้านล่างไว้เป็นหลักฐาน หรือคลิกปุ่มด้านล่างเพื่อเปิดดูบน Explorer"
                         ),
                         color=0x00FF88,
                     )
-                    dm_embed.set_footer(text="PayomboyZ Official Crypto Exchange")
+                    dm_embed.set_footer(text=f"PayomboyZ Crypto Exchange • {date_now_str}")
                     dm_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
-                    await interaction.user.send(embed=dm_embed, view=view)
-                except Exception:
-                    pass
+
+                    dm_view = discord.ui.View()
+                    dm_view.add_item(discord.ui.Button(label="🔗 ดูธุรกรรมบน Block Explorer", url=explorer_url, style=discord.ButtonStyle.link))
+
+                    if receipt_file:
+                        dm_embed.set_image(url=f"attachment://{receipt_filename}")
+                        await interaction.user.send(embed=dm_embed, file=receipt_file, view=dm_view)
+                    else:
+                        await interaction.user.send(embed=dm_embed, view=dm_view)
+                except Exception as dm_err:
+                    print(f"[DM Send Warning] {dm_err}")
 
                 # Notify Admin Log Channel (1563930679081697402)
                 admin_ch = bot.get_channel(1563930679081697402)
@@ -1436,9 +1477,16 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
                         admin_embed.add_field(name="🔗 TxID / Withdraw ID", value=f"[{tx_hash}]({explorer_url})", inline=False)
                         admin_embed.set_footer(text="Binance Master Hub Payout")
                         admin_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
-                        await admin_ch.send(embed=admin_embed)
-                    except Exception:
-                        pass
+
+                        if receipt_bytes:
+                            admin_file = discord.File(BytesIO(receipt_bytes), filename=receipt_filename)
+                            admin_embed.set_image(url=f"attachment://{receipt_filename}")
+                            await admin_ch.send(embed=admin_embed, file=admin_file)
+                        else:
+                            await admin_ch.send(embed=admin_embed)
+                    except Exception as admin_err:
+                        print(f"[Admin Log Warning] {admin_err}")
+
 
             except Exception as e:
                 # Payout failed -> 100% REFUND
