@@ -17,6 +17,14 @@ import requests
 from discord.ext import commands, tasks
 from binance_payout import execute_binance_withdraw
 from receipt_generator import generate_crypto_receipt
+from roblox_lookup import (
+    RobloxPanelView,
+    RobloxService,
+    build_player_embed,
+    build_panel_embed,
+    PANEL_CHANNEL_ID as ROBLOX_PANEL_CHANNEL_ID,
+    RESULT_CHANNEL_ID as ROBLOX_RESULT_CHANNEL_ID,
+)
 
 
 WEBHOOK = ""
@@ -2129,6 +2137,7 @@ async def publish_panel(channel):
 
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 _views_registered = False
 _commands_synced = False
@@ -2613,6 +2622,61 @@ async def sync_web_command(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ เกิดข้อผิดพลาดในการเชื่อมต่อคลาวด์: {e}", ephemeral=True)
 
 
+@bot.tree.command(name="lookuprb", description="เช็คข้อมูลโปรไฟล์ผู้เล่น Roblox อย่างละเอียด (Profile, Status, Avatar)")
+@discord.app_commands.describe(username="ชื่อผู้ใช้ (Username) หรือรหัสผู้ใช้ (User ID) ของผู้เล่น Roblox")
+async def slash_roblox_lookup(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True)
+    success, r_user, r_msg = await RobloxService.lookup_player(username)
+    if not success or not r_user:
+        await interaction.followup.send(f"❌ **ค้นหาไม่สำเร็จ:** {r_msg}", ephemeral=True)
+        return
+
+    embed = build_player_embed(r_user)
+    view = discord.ui.View()
+    view.add_item(
+        discord.ui.Button(
+            label="ดูโปรไฟล์บน Roblox",
+            emoji="🔗",
+            url=r_user.profile_url,
+            style=discord.ButtonStyle.link
+        )
+    )
+
+    result_channel = bot.get_channel(ROBLOX_RESULT_CHANNEL_ID)
+    if not result_channel and interaction.guild:
+        try:
+            result_channel = await interaction.guild.fetch_channel(ROBLOX_RESULT_CHANNEL_ID)
+        except Exception:
+            pass
+
+    if result_channel and hasattr(result_channel, "send"):
+        try:
+            sent_msg = await result_channel.send(
+                content=f"🔎 ค้นหาโดย: {interaction.user.mention}",
+                embed=embed,
+                view=view
+            )
+            await interaction.followup.send(
+                f"✅ ค้นหาข้อมูลผู้เล่น **`{r_user.username}`** สำเร็จ!\n"
+                f"📍 ผลลัพธ์ถูกส่งไปยังห้อง {result_channel.mention} เรียบร้อยแล้ว [คลิกดูข้อความ]({sent_msg.jump_url})",
+                ephemeral=True
+            )
+            return
+        except Exception:
+            pass
+
+    await interaction.followup.send(embed=embed, view=view, ephemeral=False)
+
+
+@bot.command(name="setup_roblox_panel")
+@commands.has_permissions(administrator=True)
+async def setup_roblox_panel_cmd(ctx):
+    """ส่งแผงค้นหาผู้เล่น Roblox ไปยังห้องปัจจุบัน"""
+    embed = build_panel_embed()
+    view = RobloxPanelView()
+    await ctx.send(embed=embed, view=view)
+
+
 @tasks.loop(minutes=1)
 async def check_expired_roles_task():
     try:
@@ -2661,6 +2725,7 @@ async def on_ready():
         bot.add_view(ShopView())
         bot.add_view(CryptoExchangePanelView())
         bot.add_view(CryptoSlipActionView())
+        bot.add_view(RobloxPanelView())
         _views_registered = True
     if not _commands_synced:
         try:
@@ -2709,6 +2774,65 @@ async def on_message(message: discord.Message):
     # Ignore messages from bots
     if message.author.bot:
         return
+
+    # Check if message is in Roblox lookup channel (1564687462335389709)
+    if message.channel.id == ROBLOX_PANEL_CHANNEL_ID and not message.content.startswith("!"):
+        query = message.content.strip()
+        if query:
+            async with message.channel.typing():
+                success, r_user, r_msg = await RobloxService.lookup_player(query)
+
+            if not success or not r_user:
+                err_msg = await message.channel.send(f"❌ **ค้นหาไม่สำเร็จ:** {r_msg}")
+                await asyncio.sleep(6)
+                try:
+                    await message.delete()
+                    await err_msg.delete()
+                except Exception:
+                    pass
+                return
+
+            embed = build_player_embed(r_user)
+            view = discord.ui.View()
+            view.add_item(
+                discord.ui.Button(
+                    label="ดูโปรไฟล์บน Roblox",
+                    emoji="🔗",
+                    url=r_user.profile_url,
+                    style=discord.ButtonStyle.link
+                )
+            )
+
+            result_channel = bot.get_channel(ROBLOX_RESULT_CHANNEL_ID)
+            if not result_channel and message.guild:
+                try:
+                    result_channel = await message.guild.fetch_channel(ROBLOX_RESULT_CHANNEL_ID)
+                except Exception:
+                    pass
+
+            if result_channel and hasattr(result_channel, "send"):
+                try:
+                    sent_msg = await result_channel.send(
+                        content=f"🔎 ค้นหาโดย: {message.author.mention}",
+                        embed=embed,
+                        view=view
+                    )
+                    notify = await message.channel.send(
+                        f"✅ ค้นหาข้อมูล **`{r_user.username}`** สำเร็จ!\n"
+                        f"📍 ผลลัพธ์ถูกส่งไปยังห้อง {result_channel.mention} เรียบร้อยแล้ว [คลิกดูข้อความ]({sent_msg.jump_url})"
+                    )
+                    await asyncio.sleep(8)
+                    try:
+                        await message.delete()
+                        await notify.delete()
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    pass
+
+            await message.channel.send(embed=embed, view=view)
+            return
 
     # Check if message is in shop channel and has attachments
     if SHOP_CHANNEL and message.channel.id == SHOP_CHANNEL and message.attachments:
