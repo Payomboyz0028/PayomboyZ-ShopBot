@@ -9,7 +9,8 @@ from typing import Dict, Any, Tuple
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "CJdPNL2J9vNdpDVfvFlOWf97PVk9RaxGFf3S2PezU0OMhtt0KNlvgLzGWrUwGVJp")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "3YTIo4tPGnqGFncubn5OO9TKkjWTVA8vY2nKxmSAKZLo85tRSQDlpikuHNo9tYRk")
-BASE_URL = "https://api.binance.com"
+BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/")
+BINANCE_PROXY_URL = os.getenv("BINANCE_PROXY_URL", "").strip() or os.getenv("HTTPS_PROXY", "").strip() or os.getenv("HTTP_PROXY", "").strip()
 
 # Network mapping for Binance
 NETWORK_MAP = {
@@ -18,6 +19,16 @@ NETWORK_MAP = {
     "USDT_POLYGON": ("USDT", "MATIC", "https://polygonscan.com/tx/"),
     "LTC": ("LTC", "LTC", "https://live.blockcypher.com/ltc/tx/"),
 }
+
+def get_session() -> requests.Session:
+    """Create a configured requests session with proxy support if provided."""
+    session = requests.Session()
+    if BINANCE_PROXY_URL:
+        session.proxies = {
+            "http": BINANCE_PROXY_URL,
+            "https": BINANCE_PROXY_URL,
+        }
+    return session
 
 def sign_query(query: str, secret: str = BINANCE_API_SECRET) -> str:
     return hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -29,7 +40,8 @@ def get_account_balances() -> Dict[str, float]:
     sig = sign_query(q)
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     
-    r = requests.get(f"{BASE_URL}/api/v3/account?{q}&signature={sig}", headers=headers, timeout=10)
+    session = get_session()
+    r = session.get(f"{BASE_URL}/api/v3/account?{q}&signature={sig}", headers=headers, timeout=10)
     if r.status_code != 200:
         raise Exception(f"Binance Account Error ({r.status_code}): {r.text}")
     
@@ -48,7 +60,8 @@ def auto_swap_to_coin(target_coin: str, needed_amount: float) -> bool:
     """
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     
-    r_price = requests.get(f"{BASE_URL}/api/v3/ticker/price?symbol=LTCUSDT", timeout=5)
+    session = get_session()
+    r_price = session.get(f"{BASE_URL}/api/v3/ticker/price?symbol=LTCUSDT", timeout=5)
     if r_price.status_code != 200:
         print(f"[Binance Swap] Failed to fetch ticker for LTCUSDT: {r_price.text}")
         return False
@@ -74,7 +87,7 @@ def auto_swap_to_coin(target_coin: str, needed_amount: float) -> bool:
         order_q = f"symbol=LTCUSDT&side=SELL&type=MARKET&quantity={ltc_qty:.3f}&timestamp={ts}"
         order_sig = sign_query(order_q)
         
-        r_order = requests.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
+        r_order = session.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
         if r_order.status_code == 200:
             print(f"[Binance Swap] Successfully sold {ltc_qty} LTC for USDT: {r_order.json().get('executedQty')}")
             time.sleep(1.0)
@@ -96,7 +109,7 @@ def auto_swap_to_coin(target_coin: str, needed_amount: float) -> bool:
         order_q = f"symbol=LTCUSDT&side=BUY&type=MARKET&quoteOrderQty={usdt_needed:.2f}&timestamp={ts}"
         order_sig = sign_query(order_q)
         
-        r_order = requests.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
+        r_order = session.post(f"{BASE_URL}/api/v3/order?{order_q}&signature={order_sig}", headers=headers, timeout=10)
         if r_order.status_code == 200:
             print(f"[Binance Swap] Successfully bought LTC with USDT: {r_order.json().get('executedQty')}")
             time.sleep(1.0)
@@ -117,6 +130,7 @@ def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tupl
     
     coin, network, explorer_prefix = NETWORK_MAP[asset_id]
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    session = get_session()
     
     # 1. Pre-flight check balance & auto-swap if needed
     balances = get_account_balances()
@@ -139,7 +153,7 @@ def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tupl
     params = f"coin={coin}&network={network}&address={address}&amount={amount}&timestamp={ts}"
     sig = sign_query(params)
     
-    r_withdraw = requests.post(
+    r_withdraw = session.post(
         f"{BASE_URL}/sapi/v1/capital/withdraw/apply?{params}&signature={sig}",
         headers=headers,
         timeout=20
@@ -163,7 +177,7 @@ def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tupl
             poll_ts = int(time.time() * 1000)
             hist_q = f"coin={coin}&timestamp={poll_ts}"
             hist_sig = sign_query(hist_q)
-            r_hist = requests.get(f"{BASE_URL}/sapi/v1/capital/withdraw/history?{hist_q}&signature={hist_sig}", headers=headers, timeout=5)
+            r_hist = session.get(f"{BASE_URL}/sapi/v1/capital/withdraw/history?{hist_q}&signature={hist_sig}", headers=headers, timeout=5)
             if r_hist.status_code == 200:
                 hist_data = r_hist.json()
                 for item in hist_data:
