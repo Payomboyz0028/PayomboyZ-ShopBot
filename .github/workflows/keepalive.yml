@@ -18,7 +18,7 @@ jobs:
             "https://payomboyz-aihub.onrender.com"
             "https://payomboyz-bypass.onrender.com"
             "https://sc-script-bot-0mtw.onrender.com"
-            "https://payomboyz-solve-us.onrender.com"
+            "https://payomboyz-solve-bot-us.onrender.com"
             "https://payomboyz-crypto-exchange.onrender.com"
           )
           for u in "${urls[@]}"; do
