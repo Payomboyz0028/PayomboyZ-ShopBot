@@ -2137,7 +2137,8 @@ async def publish_panel(channel):
 
 
 intents = discord.Intents.default()
-intents.message_content = True
+# intents.message_content = False (avoid PrivilegedIntentsRequired on Gateway)
+intents.message_content = False
 bot = commands.Bot(command_prefix="!", intents=intents)
 _views_registered = False
 _commands_synced = False
