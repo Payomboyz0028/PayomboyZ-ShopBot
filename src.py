@@ -2454,270 +2454,148 @@ async def show_order_confirmation(interaction: discord.Interaction, product):
 
 
 
-class ProductButtonCatalogView(discord.ui.View):
-
-    def __init__(self, user_id: int):
-
-        super().__init__(timeout=180)
-
-        self.user_id = user_id
-
-        products = store.list_products(active_only=True)
-
-        for idx, p in enumerate(products[:15]):
-
-            row = min(idx // 3, 4)
-
-            short_name = p['name'][:24]
-
-            btn = discord.ui.Button(
-
-                label=f"{short_name} — {p['price']}฿",
-
-                style=discord.ButtonStyle.secondary,
-
-                emoji=p.get('emoji') or '🛒',
-
-                row=row,
-
-                custom_id=f"pbtn_{p['product_id']}"
-
-            )
-
-            async def btn_callback(interaction: discord.Interaction, target_p=p):
-
-                if interaction.user.id != self.user_id:
-
-                    await interaction.response.send_message("หน้านี้เป็นของลูกค้าคนอื่นครับ", ephemeral=True)
-
-                    return
-
-                await interaction.response.defer(ephemeral=True)
-
-                await show_order_confirmation(interaction, target_p)
-
-            btn.callback = btn_callback
-
-            self.add_item(btn)
-
-
-
-
-
-class ShopView(discord.ui.View):
-
-    def __init__(self):
-
-        super().__init__(timeout=None)
-
-        # Legacy fallback support
-
-        self.add_item(ProductSelect())
-
-        self.add_item(CheckSelect())
-
-
-
-    @discord.ui.button(label="🛒 สั่งซื้อสินค้า", style=discord.ButtonStyle.success, custom_id="shop_buy_menu", row=0)
-
-    async def buy_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        await interaction.response.defer(ephemeral=True)
-
-        if not await member_is_verified(interaction):
-
-            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
-
-            return
-
-        balance = await asyncio.to_thread(store.get_balance, interaction.user.id)
-
-        embed = discord.Embed(
-
-            title="🛒 เลือกสินค้าที่คุณต้องการสั่งซื้อ",
-
-            description=(
-
-                f"👤 **บัญชีของคุณ:** <@{interaction.user.id}>\n"
-
-                f"💰 **ยอดเงินคงเหลือปัจจุบัน:** `{balance:,.2f} ฿`\n\n"
-
-                "👉 **กดเลือกสินค้าที่ต้องการสั่งซื้อด้านล่าง** (มีระบบยืนยัน 2 ชั้นก่อนหักเงิน):"
-
-            ),
-
-            color=0x2ECC71,
-
-        )
-
-        view = ProductButtonCatalogView(user_id=interaction.user.id)
-
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-
-
-    @discord.ui.button(label="เติมเครดิต", style=discord.ButtonStyle.primary, custom_id="shop_topup", row=0)
-
-    async def topup(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        embed = discord.Embed(
-
-            title="💳 เลือกช่องทางเติมเครดิต",
-
-            description=(
-
-                "**📱 PromptPay QR (ล็อคยอดเงิน)** — ระบุจำนวนเงินที่ต้องการ ระบบจะสร้าง QR Code พร้อมล็อคยอดให้อัตโนมัติ สแกนจ่ายง่ายไม่ต้องพิมพ์ยอด\n"
-
-                "**🏦 โอนเข้าบัญชี SCB / QR ปกติ** — โอนเข้าเลขบัญชีร้านโดยตรง หรือสแกน QR โอนตามสะดวก\n"
-
-                "**💚 ซอง TrueMoney** — วางลิงก์ซองของขวัญ TrueMoney เพื่อเติมเครดิตอัตโนมัติ\n"
-
-                "**🪙 เติมเงินผ่าน Crypto (USDT / LTC)** — ฝากเหรียญเข้า Signing Vault ตรวจบล็อก On-Chain แปลงเป็นเงินบาทเรทสด Real-time ทันที"
-
-            ),
-
-            color=0x2ECC71,
-
-        )
-
-        await interaction.response.send_message(
-
-            embed=embed,
-
-            view=TopupMethodView(),
-
-            ephemeral=True,
-
-        )
-
-
-
-    @discord.ui.button(label="เช็คเครดิต", style=discord.ButtonStyle.secondary, custom_id="shop_balance", row=0)
-
-    async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        await interaction.response.defer(ephemeral=True)
-
-        if not await member_is_verified(interaction):
-
-            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
-
-            return
-
-        amount = await asyncio.to_thread(get_balance, interaction.user.id)
-
-        desc = (
-
-            f"👤 ผู้ใช้: <@{interaction.user.id}>\n\n"
-
-            f"💰 **ยอดเครดิตคงเหลือ:** `# ฿{amount:,.2f} บาท`\n\n"
-
-            "──────────────────────────────────────────\n"
-
-            "*(เครดิตเชื่อมต่อระบบกลาง 1:1 ใช้ได้ทั้งในดิสคอร์ดและเว็บไซต์)*"
-
-        )
-
-        embed = discord.Embed(
-
-            title="💰 เครดิตคงเหลือในกระเป๋า",
-
-            description=desc,
-
-            color=0x2ECC71,
-
-        )
-
-        embed.set_footer(text="PayomboyZ Shared Wallet System • 1 Credit = 1 THB")
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-
-    @discord.ui.button(label="เช็คคีย์ของฉัน", style=discord.ButtonStyle.secondary, custom_id="shop_check_keys", row=1)
-
-    async def check_keys(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        await interaction.response.send_modal(CheckKeyModal())
-
-
-
-    @discord.ui.button(label="เช็คยศของฉัน", style=discord.ButtonStyle.secondary, custom_id="shop_check_roles", row=1)
-
-    async def check_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        await interaction.response.defer(ephemeral=True)
-
-        role_products = await asyncio.to_thread(
-
-            lambda: [p for p in store.list_products(active_only=True) if p["delivery_type"] == "role"]
-
-        )
-
-        owned = [
-
-            f"{p['emoji']} {p['name']} <@&{p['role_id']}>"
-
-            for p in role_products
-
-            if p["role_id"] and interaction.guild.get_role(int(p["role_id"])) in interaction.user.roles
-
-        ]
-
-        await interaction.followup.send(
-
-            "👑 **ยศสินค้าที่คุณมีอยู่ในขณะนี้:**\n" + ("\n".join(owned) if owned else "ยังไม่มียศจากสินค้าในร้าน"),
-
-            ephemeral=True,
-
-        )
-
-
-
-    @discord.ui.button(label="จัดการคลังคีย์ (แอดมิน)", style=discord.ButtonStyle.secondary, custom_id="shop_manage_keys", row=1)
-
-    async def manage_keys(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        if not is_admin(interaction):
-
-            if interaction.response.is_done():
-
-                await interaction.followup.send("ไม่มีสิทธิ์ใช้ส่วนนี้ครับ", ephemeral=True)
-
-            else:
-
-                await interaction.response.send_message("ไม่มีสิทธิ์ใช้ส่วนนี้ครับ", ephemeral=True)
-
-            return
-
-        if interaction.response.is_done():
-
-            await interaction.followup.send(
-
-                "เลือกคลังคีย์ที่ต้องการเพิ่ม คีย์จะถูกกรอกผ่านหน้าต่างส่วนตัว:",
-
-                view=KeyAdminView(),
-
-                ephemeral=True,
-
-            )
-
-        else:
-
-            await interaction.response.send_message(
-
-                "เลือกคลังคีย์ที่ต้องการเพิ่ม คีย์จะถูกกรอกผ่านหน้าต่างส่วนตัว:",
-
-                view=KeyAdminView(),
-
-                ephemeral=True,
-
-            )
-
-
-
-
-
+CUSTOM_PROD_EMOJIS = {
+    'WEB_LOG_VVIP': discord.PartialEmoji(name='pbg_aiscript', id=1551062845339471933),
+    'SUPER_IP': discord.PartialEmoji(name='pbg_king', id=1551063202002108446),
+    'VIP': discord.PartialEmoji(name='pbg_gem_purple', id=1566237887207309355),
+    'VIP_90': discord.PartialEmoji(name='pbg_gem_purple', id=1566237887207309355),
+    'VVIP': discord.PartialEmoji(name='pbg_king', id=1551063202002108446),
+    'VVIP_90': discord.PartialEmoji(name='pbg_king', id=1551063202002108446),
+    'AI': discord.PartialEmoji(name='pbg_aiscript', id=1551062845339471933),
+    'PLAY_ALL': discord.PartialEmoji(name='pbg_allmap', id=1551062907364839464),
+    'AUTO_QUEST': discord.PartialEmoji(name='pbg_lovediscord', id=1551057654036832436),
+}
+
+class ProductButtonCatalogView(discord.ui.View):
+    def __init__(self, products, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        for idx, p in enumerate(products[:12]):
+            row = min(idx // 3, 4)
+            short_name = p['name'][:22]
+            btn_emoji = CUSTOM_PROD_EMOJIS.get(p['product_id'], discord.PartialEmoji(name='payomboyz', id=1551064225974325318))
+            btn = discord.ui.Button(
+                label=f"{short_name} — {p['price']}฿",
+                style=discord.ButtonStyle.secondary,
+                emoji=btn_emoji,
+                row=row,
+                custom_id=f"pbtn_{p['product_id']}"
+            )
+            async def btn_callback(interaction: discord.Interaction, target_p=p):
+                if interaction.user.id != self.user_id:
+                    await interaction.response.send_message("หน้านี้เป็นของลูกค้าคนอื่นครับ", ephemeral=True)
+                    return
+                await interaction.response.defer(ephemeral=True)
+                await show_order_confirmation(interaction, target_p)
+            btn.callback = btn_callback
+            self.add_item(btn)
+
+
+class ShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="สั่งซื้อสินค้า", style=discord.ButtonStyle.success, custom_id="shop_buy_menu", row=0, emoji=discord.PartialEmoji(name="payomboyz", id=1551064225974325318))
+    async def buy_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not await member_is_verified(interaction):
+            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
+            return
+        products = await asyncio.to_thread(store.list_products, True)
+        balance = await asyncio.to_thread(store.get_balance, interaction.user.id)
+        embed = discord.Embed(
+            title="🛒 เลือกสินค้าที่คุณต้องการสั่งซื้อ",
+            description=(
+                f"👤 **บัญชีของคุณ:** <@{interaction.user.id}>\n"
+                f"💰 **ยอดเงินคงเหลือปัจจุบัน:** `{balance:,.2f} ฿`\n\n"
+                "👉 **กดเลือกสินค้าที่ต้องการด้านล่าง** (ระบบมีความปลอดภัย ยืนยัน 2 ชั้นก่อนหักเงิน):"
+            ),
+            color=0x2ECC71,
+        )
+        view = ProductButtonCatalogView(products=products, user_id=interaction.user.id)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="เติมเครดิต", style=discord.ButtonStyle.primary, custom_id="shop_topup", row=0, emoji=discord.PartialEmoji(name="Truemoney", id=1564046207536463922))
+    async def topup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="💳 เลือกช่องทางเติมเครดิต",
+            description=(
+                "**📱 PromptPay QR (ล็อคยอดเงิน)** — ระบุจำนวนเงินที่ต้องการ ระบบจะสร้าง QR Code พร้อมล็อคยอดให้อัตโนมัติ สแกนจ่ายง่ายไม่ต้องพิมพ์ยอด\n"
+                "**🏦 โอนเข้าบัญชี SCB / QR ปกติ** — โอนเข้าเลขบัญชีร้านโดยตรง หรือสแกน QR โอนตามสะดวก\n"
+                "**💚 ซอง TrueMoney** — วางลิงก์ซองของขวัญ TrueMoney เพื่อเติมเครดิตอัตโนมัติ\n"
+                "**🪙 เติมเงินผ่าน Crypto (USDT / LTC)** — ฝากเหรียญเข้า Signing Vault ตรวจบล็อก On-Chain แปลงเป็นเงินบาทเรทสด Real-time ทันที"
+            ),
+            color=0x2ECC71,
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=TopupMethodView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="เช็คเครดิต", style=discord.ButtonStyle.secondary, custom_id="shop_balance", row=0, emoji=discord.PartialEmoji(name="pbg_greedy", id=1551057309478948974))
+    async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not await member_is_verified(interaction):
+            await interaction.followup.send("ต้องมียศยืนยันตัวตนก่อนใช้ร้านครับ", ephemeral=True)
+            return
+        amount = await asyncio.to_thread(get_balance, interaction.user.id)
+        desc = (
+            f"👤 ผู้ใช้: <@{interaction.user.id}>\n\n"
+            f"💰 **ยอดเครดิตคงเหลือ:** `# ฿{amount:,.2f} บาท`\n\n"
+            "──────────────────────────────────────────\n"
+            "*(เครดิตเชื่อมต่อระบบกลาง 1:1 ใช้ได้ทั้งในดิสคอร์ดและเว็บไซต์)*"
+        )
+        embed = discord.Embed(
+            title="💰 เครดิตคงเหลือในกระเป๋า",
+            description=desc,
+            color=0x2ECC71,
+        )
+        embed.set_footer(text="PayomboyZ Shared Wallet System • 1 Credit = 1 THB")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="เช็คคีย์ของฉัน", style=discord.ButtonStyle.secondary, custom_id="shop_check_keys", row=1, emoji=discord.PartialEmoji(name="dekucheer", id=1551025578470281248))
+    async def check_keys(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CheckKeyModal())
+
+    @discord.ui.button(label="เช็คยศของฉัน", style=discord.ButtonStyle.secondary, custom_id="shop_check_roles", row=1, emoji=discord.PartialEmoji(name="kacchancheer", id=1551026067400294520))
+    async def check_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        role_products = await asyncio.to_thread(
+            lambda: [p for p in store.list_products(active_only=True) if p["delivery_type"] == "role"]
+        )
+        owned = [
+            f"{p['emoji']} {p['name']} <@&{p['role_id']}>"
+            for p in role_products
+            if p["role_id"] and interaction.guild.get_role(int(p["role_id"])) in interaction.user.roles
+        ]
+        await interaction.followup.send(
+            "👑 **ยศสินค้าที่คุณมีอยู่ในขณะนี้:**\n" + ("\n".join(owned) if owned else "ยังไม่มียศจากสินค้าในร้าน"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="คลังคีย์ (แอดมิน)", style=discord.ButtonStyle.secondary, custom_id="shop_manage_keys", row=1, emoji=discord.PartialEmoji(name="mine", id=1551054353475838103))
+    async def manage_keys(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            if interaction.response.is_done():
+                await interaction.followup.send("ไม่มีสิทธิ์ใช้ส่วนนี้ครับ", ephemeral=True)
+            else:
+                await interaction.response.send_message("ไม่มีสิทธิ์ใช้ส่วนนี้ครับ", ephemeral=True)
+            return
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "เลือกคลังคีย์ที่ต้องการเพิ่ม คีย์จะถูกกรอกผ่านหน้าต่างส่วนตัว:",
+                view=KeyAdminView(),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "เลือกคลังคีย์ที่ต้องการเพิ่ม คีย์จะถูกกรอกผ่านหน้าต่างส่วนตัว:",
+                view=KeyAdminView(),
+                ephemeral=True,
+            )
+
+
 class KeyProductSelect(discord.ui.Select):
     def __init__(self, mode, row):
         products = [p for p in store.list_products(active_only=True) if p["delivery_type"] == "key"][:25]
