@@ -1749,45 +1749,59 @@ class InsufficientCreditView(discord.ui.View):
         await interaction.response.send_message(embed=embed, view=TopupMethodView(), ephemeral=True)
 
 
-class OrderConfirmView(discord.ui.View):
-    def __init__(self, product, user_id: int):
-        super().__init__(timeout=120)
-        self.product = product
-        self.user_id = user_id
-        self.product_id = product["product_id"]
-        self.price = int(product["price"])
-
-    @discord.ui.button(label="ยืนยันการสั่งซื้อ", style=discord.ButtonStyle.success, emoji="✅", row=0)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
-            return
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content="⏳ **กำลังประมวลผลคำสั่งซื้อและส่งมอบสินค้า กรุณารอสักครู่...**",
-            embed=None,
-            view=self
-        )
-
-        await execute_confirmed_purchase(interaction, self.product_id)
-
-    @discord.ui.button(label="ยกเลิกคำสั่งซื้อ", style=discord.ButtonStyle.secondary, emoji="❌", row=0)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
-            return
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content="❌ **ยกเลิกคำสั่งซื้อเรียบร้อยแล้ว** ยอดเงินของคุณยังคงอยู่ครบถ้วนครับ",
-            embed=None,
-            view=None
-        )
-
-
+class OrderConfirmView(discord.ui.View):
+    def __init__(self, product, user_id: int):
+        super().__init__(timeout=120)
+        self.product = product
+        self.user_id = user_id
+        self.product_id = product["product_id"]
+        self.price = int(product["price"])
+        # Two-click safety gate: first click arms, second fires
+        self._armed = False
+
+    @discord.ui.button(label="⚠️ กดอีกครั้งเพื่อยืนยันการซื้อจริงๆ", style=discord.ButtonStyle.danger, emoji="⚠️", row=0)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+        if not self._armed:
+            self._armed = True
+            price_str = f"{self.price:,}"
+            button.label = f"✅ ยืนยันซื้อ {price_str}฿ — กดอีกครั้งเพื่อยืนยัน"
+            button.style = discord.ButtonStyle.success
+            button.emoji = discord.PartialEmoji(name="✅")
+            prod_name = self.product["name"]
+            price = self.price
+            warn_msg = (
+                f"⚠️ **คุณกำลังจะซื้อ `{prod_name}` ราคา `{price_str} ฿`**\n"
+                "⚠️ **เครดิตจะถูกหักทันทีที่กดยืนยัน** — ถ้าแน่ใจแล้วให้กดปุ่มสีเขียวอีกครั้ง"
+            )
+            await interaction.response.edit_message(content=warn_msg, view=self)
+            return
+        # Second click: execute purchase
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="⏳ **กำลังประมวลผลคำสั่งซื้อและส่งมอบสินค้า กรุณารอสักครู่...**",
+            embed=None,
+            view=self
+        )
+        await execute_confirmed_purchase(interaction, self.product_id)
+
+    @discord.ui.button(label="❌ ยกเลิก — ไม่ซื้อ", style=discord.ButtonStyle.secondary, emoji="❌", row=0)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="❌ **ยกเลิกคำสั่งซื้อเรียบร้อยแล้ว** ยอดเงินของคุณยังคงอยู่ครบถ้วนครับ",
+            embed=None,
+            view=None
+        )
+
+
 class InsufficientCreditConfirmView(discord.ui.View):
     def __init__(self, shortage: float, user_id: int):
         super().__init__(timeout=180)
