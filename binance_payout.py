@@ -193,3 +193,91 @@ def execute_binance_withdraw(asset_id: str, address: str, amount: float) -> Tupl
     
     explorer_url = f"{explorer_prefix}{tx_hash}"
     return True, withdraw_id, tx_hash, explorer_url
+
+
+def get_binance_total_usdt_balance() -> Tuple[float, Dict[str, float]]:
+    """
+    Calculates total spot portfolio value converted to USDT equivalent.
+    Returns: (total_usdt: float, asset_balances: Dict[str, float])
+    """
+    session = get_session()
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    ts = int(time.time() * 1000)
+    q = f"timestamp={ts}"
+    sig = sign_query(q)
+    
+    try:
+        r = session.get(f"{BASE_URL}/api/v3/account?{q}&signature={sig}", headers=headers, timeout=10)
+        if r.status_code != 200:
+            return 0.0, {}
+        balances = r.json().get("balances", [])
+    except Exception as e:
+        print(f"[get_binance_total_usdt_balance Account Error] {e}")
+        return 0.0, {}
+    
+    # Get live prices
+    try:
+        ticker_res = session.get(f"{BASE_URL}/api/v3/ticker/price", timeout=5).json()
+        price_map = {t["symbol"]: float(t["price"]) for t in ticker_res}
+    except Exception:
+        price_map = {}
+        
+    price_map["USDTUSDT"] = 1.0
+    total_usdt = 0.0
+    asset_dict = {}
+    
+    for b in balances:
+        free = float(b.get("free", 0))
+        locked = float(b.get("locked", 0))
+        tot = free + locked
+        if tot > 0.00000001:
+            sym = b["asset"]
+            asset_dict[sym] = tot
+            if sym == "USDT":
+                total_usdt += tot
+            else:
+                pair = f"{sym}USDT"
+                p = price_map.get(pair, 0.0)
+                total_usdt += tot * p
+                
+    return round(total_usdt, 4), asset_dict
+
+
+def get_network_withdrawal_status() -> Dict[str, Dict[str, Any]]:
+    """
+    Checks withdrawal and deposit status for all supported networks on Binance.
+    """
+    session = get_session()
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    ts = int(time.time() * 1000)
+    q = f"timestamp={ts}"
+    sig = sign_query(q)
+    
+    try:
+        r = session.get(f"{BASE_URL}/sapi/v1/capital/config/getall?{q}&signature={sig}", headers=headers, timeout=10)
+        if r.status_code != 200:
+            return {}
+        coins_data = r.json()
+    except Exception as e:
+        print(f"[get_network_withdrawal_status Error] {e}")
+        return {}
+        
+    status_map = {}
+    for item in coins_data:
+        c_sym = item["coin"]
+        for net in item.get("networkList", []):
+            n_name = net.get("network")
+            for asset_id, (target_coin, target_net, _) in NETWORK_MAP.items():
+                if c_sym == target_coin and n_name == target_net:
+                    status_map[asset_id] = {
+                        "coin": c_sym,
+                        "network": n_name,
+                        "network_name": net.get("name"),
+                        "can_withdraw": bool(net.get("withdrawEnable")),
+                        "can_deposit": bool(net.get("depositEnable")),
+                        "min_withdraw": float(net.get("withdrawMin", 0)),
+                        "fee": float(net.get("withdrawFee", 0)),
+                        "notice": net.get("withdrawDesc", ""),
+                    }
+    return status_map
+

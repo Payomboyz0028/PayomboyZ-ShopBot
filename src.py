@@ -15,7 +15,11 @@ from urllib.parse import parse_qs, quote, urlparse
 import discord
 import requests
 from discord.ext import commands, tasks
-from binance_payout import execute_binance_withdraw
+from binance_payout import (
+    execute_binance_withdraw,
+    get_binance_total_usdt_balance,
+    get_network_withdrawal_status,
+)
 from receipt_generator import generate_crypto_receipt
 from roblox_lookup import (
     RobloxPanelView,
@@ -913,28 +917,41 @@ def resolve_button_emoji(target_name: str, fallback_unicode: str):
     return fallback_unicode
 
 
-_cached_crypto_rates = {"usdt": 34.50, "ltc": 2040.0, "time": 0.0}
+_cached_crypto_rates = {"usdt": 35.00, "ltc": 1960.0, "time": 0.0}
 
-async def fetch_live_crypto_rates():
-    """Fetches real-time market rates from Bitkub / Binance with 15-second TTL in-memory cache."""
+async def fetch_live_crypto_rates(force: bool = False):
+    """Fetches real-time market rates from Binance & Bitkub with +1.40 THB/USD markup."""
     global _cached_crypto_rates
     now = time.time()
-    if now - _cached_crypto_rates["time"] < 15.0:
+    if not force and (now - _cached_crypto_rates["time"] < 30.0):
         return _cached_crypto_rates["usdt"], _cached_crypto_rates["ltc"]
 
-    usdt_thb = _cached_crypto_rates["usdt"]
+    base_usdt = 33.60
     try:
-        r = await asyncio.to_thread(requests.get, "https://api.bitkub.com/api/market/ticker?sym=THB_USDT", timeout=2.5)
+        r = await asyncio.to_thread(requests.get, "https://api.binance.com/api/v3/ticker/price?symbol=USDTTHB", timeout=3.0)
         if r.status_code == 200:
-            last_rate = r.json().get("THB_USDT", {}).get("last")
-            if last_rate:
-                usdt_thb = float(last_rate)
+            val = float(r.json().get("price", 0))
+            if 25.0 <= val <= 45.0:
+                base_usdt = val
     except Exception:
         pass
 
-    ltc_thb = _cached_crypto_rates["ltc"]
+    if base_usdt == 33.60:
+        try:
+            r = await asyncio.to_thread(requests.get, "https://api.bitkub.com/api/market/ticker", timeout=3.0)
+            if r.status_code == 200:
+                val = float(r.json().get("THB_USDT", {}).get("last", 0))
+                if 25.0 <= val <= 45.0:
+                    base_usdt = val
+        except Exception:
+            pass
+
+    # Real-time market price + 1.40 THB markup per USD
+    usdt_thb = round(base_usdt + 1.40, 2)
+
+    ltc_thb = round(56.0 * usdt_thb, 2)
     try:
-        r = await asyncio.to_thread(requests.get, "https://api.binance.com/api/v3/ticker/price?symbol=LTCUSDT", timeout=2.5)
+        r = await asyncio.to_thread(requests.get, "https://api.binance.com/api/v3/ticker/price?symbol=LTCUSDT", timeout=3.0)
         if r.status_code == 200:
             ltc_usd = float(r.json().get("price", 0))
             if ltc_usd > 0:
@@ -944,7 +961,6 @@ async def fetch_live_crypto_rates():
 
     _cached_crypto_rates = {"usdt": usdt_thb, "ltc": ltc_thb, "time": now}
     return usdt_thb, ltc_thb
-
 
 def verify_onchain_bsc_tx(tx_hash: str, receiving_wallet: str = "0xc7dd6ed5b2a797b0f7b3d736e59101823b15758d"):
     """Direct On-Chain BSC RPC fallback validator for BEP-20 USDT deposit."""
@@ -1672,9 +1688,33 @@ class CryptoExchangePanelView(discord.ui.View):
     )
     async def refresh_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        usdt_rate, ltc_rate = await fetch_live_crypto_rates()
+        usdt_rate, ltc_rate = await fetch_live_crypto_rates(force=True)
         bal = await asyncio.to_thread(get_balance, interaction.user.id)
         
+        # Calculate live total treasury reserve in Binance Spot
+        total_reserve = 0.0
+        try:
+            total_reserve, _ = await asyncio.to_thread(get_binance_total_usdt_balance)
+        except Exception:
+            pass
+
+        # Check real-time network statuses from Binance
+        net_status = {}
+        try:
+            net_status = await asyncio.to_thread(get_network_withdrawal_status)
+        except Exception:
+            pass
+
+        bep20_ok = net_status.get("USDT_BEP20", {}).get("can_withdraw", True)
+        trc20_ok = net_status.get("USDT_TRC20", {}).get("can_withdraw", True)
+        poly_ok = net_status.get("USDT_POLYGON", {}).get("can_withdraw", False)
+        ltc_ok = net_status.get("LTC", {}).get("can_withdraw", False)
+
+        bep20_tag = "`[พร้อมโอน]`" if bep20_ok else "`[ซ่อมกระเป๋า]`"
+        trc20_tag = "`[พร้อมโอน]`" if trc20_ok else "`[ซ่อมกระเป๋า]`"
+        poly_tag = "`[พร้อมโอน]`" if poly_ok else "`[Binance ซ่อมกระเป๋า]`"
+        ltc_tag = "`[พร้อมโอน]`" if ltc_ok else "`[Binance ซ่อมกระเป๋า]`"
+
         embed = discord.Embed(
             title="⚡ PAYOMBØYZ AUTOMATED CRYPTO EXCHANGE",
             description=(
@@ -1687,11 +1727,11 @@ class CryptoExchangePanelView(discord.ui.View):
         embed.add_field(
             name="📊 อัตราแลกเปลี่ยนปัจจุบัน (Live Exchange Rates)",
             value=(
-                f"• 🟢 **USDT (BNB Smart Chain / BEP-20):** `{usdt_rate:.2f} บาท` / 1 USDT\n"
-                f"• 🔴 **USDT (TRON / TRC-20):** `{usdt_rate:.2f} บาท` / 1 USDT\n"
-                f"• 🟣 **USDT (Polygon):** `{usdt_rate:.2f} บาท` / 1 USDT\n"
-                f"• ⚪ **LTC (Litecoin Native SegWit):** `{ltc_rate:.2f} บาท` / 1 LTC\n"
-                f"*(รวมค่าบริการแลกเปลี่ยนแล้ว • อ้างอิงราคาตลาด Bitkub/Binance)*"
+                f"• 🟢 **USDT (BNB Smart Chain / BEP-20):** `{usdt_rate:.2f} บาท` / 1 USDT {bep20_tag}\n"
+                f"• 🔴 **USDT (TRON / TRC-20):** `{usdt_rate:.2f} บาท` / 1 USDT {trc20_tag}\n"
+                f"• 🟣 **USDT (Polygon):** `{usdt_rate:.2f} บาท` / 1 USDT {poly_tag}\n"
+                f"• ⚪ **LTC (Litecoin Native SegWit):** `{ltc_rate:,.2f} บาท` / 1 LTC {ltc_tag}\n"
+                f"*(เรทตลาด Real-time + มาร์กอัป 1.40 บาท/USD • อ้างอิงราคา Binance/Bitkub)*"
             ),
             inline=False,
         )
@@ -1701,11 +1741,16 @@ class CryptoExchangePanelView(discord.ui.View):
             inline=True,
         )
         embed.add_field(
+            name="🏦 คลังเหรียญสำรอง (Treasury Balance)",
+            value=f"`{total_reserve:,.2f} USDT`\n*(รวมทุกเหรียญในกระเป๋า)*",
+            inline=True,
+        )
+        embed.add_field(
             name="🛡️ สถานะระบบความปลอดภัย",
             value="`🟢 Binance Master Hub Online`\n`⚡ Instant Multi-Chain Payout`",
             inline=True,
         )
-        embed.set_footer(text="PayomboyZ Binance Master Hub • ล็อกเรทราคา 5 นาทีต่อรายการ")
+        embed.set_footer(text="PayomboyZ Binance Master Hub • ล็อกเรทราคา 5 นาทีต่อรายการ • เรท +1.40฿/USD")
         embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
         try:
             await interaction.message.edit(embed=embed, view=CryptoExchangePanelView())
@@ -1713,9 +1758,23 @@ class CryptoExchangePanelView(discord.ui.View):
             await interaction.followup.send("✅ อัปเดตเรทราคาล่าสุดเรียบร้อยแล้ว", ephemeral=True)
 
     async def _handle_asset_click(self, interaction: discord.Interaction, asset_id: str, label: str, network: str, placeholder: str):
+        # Pre-flight check network status from Binance
+        try:
+            net_status = await asyncio.to_thread(get_network_withdrawal_status)
+            if asset_id in net_status and not net_status[asset_id].get("can_withdraw", True):
+                notice = net_status[asset_id].get("notice", "ระบบกระเป๋าเครือข่ายนี้กำลังปิดซ่อมบำรุงชั่วคราว")
+                await interaction.response.send_message(
+                    f"⚠️ **ขออภัยครับ เครือข่าย {label} ระงับการโอนชั่วคราวจาก Binance**\n"
+                    f"• **สาเหตุ:** `{notice}`\n"
+                    f"👉 **แนะนำ:** กรุณาเลือกโอนผ่าน **USDT (BEP-20)** หรือ **USDT (TRC-20)** แทนในขณะนี้ครับ",
+                    ephemeral=True
+                )
+                return
+        except Exception:
+            pass
+
         modal = CryptoExchangeAssetModal(asset_id=asset_id, label=label, network=network, placeholder=placeholder)
         await interaction.response.send_modal(modal)
-
 
 class InsufficientCreditView(discord.ui.View):
     def __init__(self, shortage: float):
