@@ -1749,17 +1749,98 @@ class InsufficientCreditView(discord.ui.View):
         await interaction.response.send_message(embed=embed, view=TopupMethodView(), ephemeral=True)
 
 
-async def buy_product(interaction, product_id):
-    # 0. Instantly defer within < 50ms to satisfy Discord's strict 3-second interaction window
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=True)
+class OrderConfirmView(discord.ui.View):
+    def __init__(self, product, user_id: int):
+        super().__init__(timeout=120)
+        self.product = product
+        self.user_id = user_id
+        self.product_id = product["product_id"]
+        self.price = int(product["price"])
 
+    @discord.ui.button(label="ยืนยันการสั่งซื้อ", style=discord.ButtonStyle.success, emoji="✅", row=0)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="⏳ **กำลังประมวลผลคำสั่งซื้อและส่งมอบสินค้า กรุณารอสักครู่...**",
+            embed=None,
+            view=self
+        )
+
+        await execute_confirmed_purchase(interaction, self.product_id)
+
+    @discord.ui.button(label="ยกเลิกคำสั่งซื้อ", style=discord.ButtonStyle.secondary, emoji="❌", row=0)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="❌ **ยกเลิกคำสั่งซื้อเรียบร้อยแล้ว** ยอดเงินของคุณยังคงอยู่ครบถ้วนครับ",
+            embed=None,
+            view=None
+        )
+
+
+class InsufficientCreditConfirmView(discord.ui.View):
+    def __init__(self, shortage: float, user_id: int):
+        super().__init__(timeout=180)
+        self.shortage = shortage
+        self.user_id = user_id
+
+    @discord.ui.button(
+        label="เติมเงินส่วนที่ขาด (สร้าง QR ทันที)",
+        emoji="📱",
+        style=discord.ButtonStyle.primary,
+    )
+    async def topup_shortage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+        await send_locked_qr_message(interaction, self.shortage)
+
+    @discord.ui.button(
+        label="เลือกช่องทางเติมเครดิตอื่น",
+        emoji="💳",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def other_method(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="💳 เลือกช่องทางเติมเครดิต",
+            description=(
+                "**📱 PromptPay QR (ล็อคยอด)** — ระบุยอดเงินเพื่อสร้าง QR Code ล็อคยอด\n"
+                "**🏦 โอนเข้าบัญชี SCB** — โอนเข้าเลขบัญชีธนาคารของร้านโดยตรง\n"
+                "**💚 ซอง TrueMoney** — เติมด้วยลิงก์ซองของขวัญ TrueMoney\n"
+                "**🪙 เติมเงินผ่าน Crypto (USDT / LTC)** — ฝากเหรียญเข้า Signing Vault ตรวจบล็อก On-Chain แปลงเป็นบาท Real-time"
+            ),
+            color=0x2ECC71,
+        )
+        await interaction.response.send_message(embed=embed, view=TopupMethodView(), ephemeral=True)
+
+    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("คุณไม่ใช่เจ้าของคำสั่งซื้อนี้ครับ", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="❌ **ยกเลิกคำสั่งซื้อเรียบร้อยแล้ว**", embed=None, view=None)
+
+
+async def execute_confirmed_purchase(interaction, product_id):
     if not await require_verified(interaction):
         return
 
     product = await asyncio.to_thread(store.get_product, product_id)
     if not product or not product["active"]:
-        await interaction.followup.send("สินค้านี้ไม่มีขายแล้วครับ", ephemeral=True)
+        await interaction.edit_original_response(content="❌ สินค้านี้ไม่มีขายแล้วครับ", embed=None, view=None)
         return
 
     price = int(product["price"])
@@ -1771,13 +1852,21 @@ async def buy_product(interaction, product_id):
         role = guild.get_role(int(product["role_id"] or 0))
         bot_member = guild.me
         if not role or not bot_member or not bot_member.guild_permissions.manage_roles or role >= bot_member.top_role:
-            await interaction.followup.send("บอทตั้งค่าสิทธิ์มอบยศของสินค้านี้ไม่ครบครับ แจ้งแอดมินได้เลย", ephemeral=True)
+            await interaction.edit_original_response(
+                content="⚠️ บอทตั้งค่าสิทธิ์มอบยศของสินค้านี้ไม่ครบครับ แจ้งแอดมินได้เลย",
+                embed=None,
+                view=None
+            )
             return
 
         role_days = int(product.get("role_days", 0) or 0)
         has_role = role in interaction.user.roles
         if has_role and role_days == 0:
-            await interaction.followup.send("คุณมียศนี้อยู่แล้วครับ (ยศถาวร)", ephemeral=True)
+            await interaction.edit_original_response(
+                content="⚠️ คุณมียศนี้อยู่แล้วครับ (ยศถาวร)",
+                embed=None,
+                view=None
+            )
             return
 
         order_id = await asyncio.to_thread(store.charge_role_product, user_id, product_id, price)
@@ -1785,10 +1874,10 @@ async def buy_product(interaction, product_id):
             balance = await asyncio.to_thread(store.get_balance, user_id)
             shortage = max(0.0, price - balance)
             view = InsufficientCreditView(shortage=shortage) if shortage > 0 else None
-            await interaction.followup.send(
-                f"⚠️ เครดิตไม่พอครับ ยอดคุณ {balance:.2f}฿ สินค้าราคา {price}฿ (ขาดอีก {shortage:.2f}฿)",
+            await interaction.edit_original_response(
+                content=f"⚠️ เครดิตไม่พอครับ ยอดคุณ {balance:.2f}฿ สินค้าราคา {price}฿ (ขาดอีก {shortage:.2f}฿)",
+                embed=None,
                 view=view,
-                ephemeral=True,
             )
             return
 
@@ -1805,7 +1894,11 @@ async def buy_product(interaction, product_id):
             )
         except discord.HTTPException:
             await asyncio.to_thread(store.finish_role_purchase, order_id, "refunded")
-            await interaction.followup.send("มอบยศไม่สำเร็จ ระบบคืนเครดิตให้แล้วครับ ติดต่อแอดมินได้เลย", ephemeral=True)
+            await interaction.edit_original_response(
+                content="⚠️ มอบยศไม่สำเร็จ ระบบคืนเครดิตให้แล้วครับ ติดต่อแอดมินได้เลย",
+                embed=None,
+                view=None
+            )
             return
 
         await asyncio.to_thread(store.finish_role_purchase, order_id, "complete")
@@ -1814,38 +1907,69 @@ async def buy_product(interaction, product_id):
             dur_msg = f" (ระยะเวลา {role_days} วัน · หมดอายุ: `{expires_at}` UTC)"
         else:
             dur_msg = " (ถาวร)"
-        await interaction.followup.send(
-            f"✅ ซื้อ **{product['name']}** สำเร็จ ได้รับ <@&{role.id}>{dur_msg} · เครดิตคงเหลือ: `{balance:.2f}฿`",
-            ephemeral=True,
+
+        receipt_embed = discord.Embed(
+            title="🎉 สั่งซื้อยศสำเร็จ (Role Subscription Activated)",
+            description=(
+                f"ขอขอบคุณที่ใช้บริการ **PAYOMBØYZ-SHOP**\n\n"
+                f"• **สินค้า**: **{product['name']}**\n"
+                f"• **ยศที่ได้รับ**: <@&{role.id}>{dur_msg}\n"
+                f"• **หักเครดิต**: **{price:,} ฿**\n"
+                f"• **เครดิตคงเหลือ**: `{balance:.2f} ฿`\n\n"
+                f"✅ **ระบบได้มอบยศให้บัญชีของคุณเรียบร้อยแล้ว** สามารถใช้งานห้องและบอทได้ทันที!"
+            ),
+            color=0x2ECC71,
         )
+        receipt_embed.set_footer(text="PAYOMBØYZ-SHOP • บันทึกคำสั่งซื้อลงระบบเรียบร้อยแล้ว")
+        await interaction.edit_original_response(content="", embed=receipt_embed, view=None)
         return
 
-    # DELIVERY TYPE: KEY (100% Native Supabase)
+    # DELIVERY TYPE: KEY
     result, error = await asyncio.to_thread(store.buy_key, user_id, product_id, price)
     if error == "เครดิตไม่พอ":
         balance = await asyncio.to_thread(store.get_balance, user_id)
         shortage = max(0.0, price - balance)
         view = InsufficientCreditView(shortage=shortage) if shortage > 0 else None
-        await interaction.followup.send(
-            f"⚠️ เครดิตไม่พอครับ ยอดของคุณ {balance:.2f}฿ สินค้าราคา {price}฿ (ขาดอีก {shortage:.2f}฿)",
+        await interaction.edit_original_response(
+            content=f"⚠️ เครดิตไม่พอครับ ยอดของคุณ {balance:.2f}฿ สินค้าราคา {price}฿ (ขาดอีก {shortage:.2f}฿)",
+            embed=None,
             view=view,
-            ephemeral=True,
         )
         return
     elif error:
-        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        await interaction.edit_original_response(content=f"❌ {error} กรุณาติดต่อแอดมินครับ", embed=None, view=None)
         return
 
     delivered_key = result["key"]
     order_id = result["purchase_id"]
     bal_now = result.get("new_balance", await asyncio.to_thread(store.get_balance, user_id))
-    await interaction.followup.send(
-        f"✅ ซื้อ **{product['name']}** สำเร็จ!\n"
-        f"🔑 คีย์ของคุณ (เก็บไว้เป็นความลับ):\n```{delivered_key}```\n"
-        f"🛒 รหัสคำสั่งซื้อ: `{order_id}` · เครดิตคงเหลือ: `{bal_now:.2f}฿`\n"
-        f"🌐 นำคีย์ไปเปิดใช้งานได้ที่: https://payomboyzcreative.online/",
-        ephemeral=True,
+
+    receipt_embed = discord.Embed(
+        title="🎉 สั่งซื้อสินค้าสำเร็จ (License Key Delivered)",
+        description=(
+            f"ขอขอบคุณที่ใช้บริการ **PAYOMBØYZ-SHOP**\n\n"
+            f"• **สินค้า**: **{product['name']}**\n"
+            f"• **หักเครดิต**: **{price:,} ฿**\n"
+            f"• **รหัสคำสั่งซื้อ**: `{order_id}`\n"
+            f"• **เครดิตคงเหลือ**: `{bal_now:,.2f} ฿`\n\n"
+            f"🔑 **คีย์ของคุณ (เก็บไว้เป็นความลับ ห้ามเปิดเผย):**\n"
+            f"```{delivered_key}```\n"
+            f"📌 **ช่องทางเปิดใช้งาน & ขอรับสิทธิ์:**\n"
+            f"↳ <#1549827759457570906> (ใส่คีย์รับยศสคริปต์)\n"
+            f"↳ <#1550444661703975002> (รีเซ็ต HWID)\n"
+            f"↳ <#1550534429024456844> (ห้องสคริปต์)\n"
+            f"↳ https://payomboyzcreative.online/ (แดชบอร์ด Whitelist)"
+        ),
+        color=0x2ECC71,
     )
+    receipt_embed.set_footer(text="PAYOMBØYZ-SHOP • บันทึกคำสั่งซื้อลงระบบเรียบร้อยแล้ว")
+    await interaction.edit_original_response(content="", embed=receipt_embed, view=None)
+
+
+async def buy_product(interaction, product_id):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    await execute_confirmed_purchase(interaction, product_id)
 
 
 class ProductSelect(discord.ui.Select):
@@ -1869,11 +1993,88 @@ class ProductSelect(discord.ui.Select):
             row=0,
         )
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "__none__":
             await interaction.response.send_message("ยังไม่มีสินค้าเปิดขายครับ", ephemeral=True)
             return
-        await buy_product(interaction, self.values[0])
+
+        if not await require_verified(interaction):
+            return
+
+        product_id = self.values[0]
+        product = await asyncio.to_thread(store.get_product, product_id)
+        if not product or not product["active"]:
+            await interaction.response.send_message("❌ สินค้านี้ไม่มีขายแล้วครับ", ephemeral=True)
+            return
+
+        price = int(product["price"])
+        balance = await asyncio.to_thread(store.get_balance, interaction.user.id)
+
+        # Check stock for key products
+        if product["delivery_type"] == "key":
+            counts = await asyncio.to_thread(store.key_counts)
+            stock_avail = counts.get(product_id, 0)
+            if stock_avail <= 0:
+                await interaction.response.send_message(
+                    f"❌ สินค้า **{product['name']}** หมดคลังชั่วคราวครับ กรุณารอแอดมินเติมคีย์ หรือเลือกสินค้าอื่น",
+                    ephemeral=True
+                )
+                return
+            delivery_desc = f"🔑 **รับ License Key ทันที** (ในคลังมี {stock_avail} คีย์)"
+        else:
+            role_days = int(product.get("role_days", 0) or 0)
+            role_dur = f"{role_days} วัน" if role_days > 0 else "ถาวร"
+            delivery_desc = f"👤 **รับยศ Discord อัตโนมัติ** (<@&{product['role_id']}> • {role_dur})"
+
+        can_afford = (balance >= price)
+        remaining = max(0.0, balance - price)
+        shortage = max(0.0, price - balance)
+
+        embed = discord.Embed(
+            title="🛒 ยืนยันคำสั่งซื้อ (Order Confirmation)",
+            description=(
+                f"คุณได้เลือกทำรายการสั่งซื้อ **{product['name']}**\n"
+                "โปรดตรวจสอบรายละเอียดด้านล่างให้ถูกต้องก่อนกดยืนยันการชำระเงิน"
+            ),
+            color=0x8A2BE2 if can_afford else 0xEF4444,
+        )
+        embed.add_field(
+            name="📦 รายละเอียดสินค้า",
+            value=(
+                f"• **ชื่อสินค้า**: `{product['name']}`\n"
+                f"• **ราคา**: `{price:,} ฿`\n"
+                f"• **รูปแบบจัดส่ง**: {delivery_desc}"
+            ),
+            inline=False
+        )
+
+        if can_afford:
+            embed.add_field(
+                name="💳 ข้อมูลเครดิตของคุณ",
+                value=(
+                    f"• **ยอดเงินปัจจุบัน**: `{balance:,.2f} ฿`\n"
+                    f"• **ค่าสินค้าที่ต้องชำระ**: `-{price:,} ฿`\n"
+                    f"• **ยอดเงินคงเหลือหลังสั่งซื้อ**: `{remaining:,.2f} ฿`"
+                ),
+                inline=False
+            )
+            embed.set_footer(text="⚠️ เมื่อกดยืนยัน ระบบจะตัดเครดิตและส่งมอบสินค้าให้ทันที")
+            view = OrderConfirmView(product, interaction.user.id)
+        else:
+            embed.add_field(
+                name="⚠️ ยอดเงินในบัญชีไม่เพียงพอ",
+                value=(
+                    f"• **ยอดเงินปัจจุบัน**: `{balance:,.2f} ฿`\n"
+                    f"• **ราคาสินค้า**: `{price:,} ฿`\n"
+                    f"• **ยอดที่ขาดอีก**: `{shortage:,.2f} ฿`\n\n"
+                    "👉 กรุณากดปุ่ม **เติมเครดิต** ด้านล่างเพื่อเติมเงินก่อนสั่งซื้อ"
+                ),
+                inline=False
+            )
+            embed.set_footer(text="❌ ไม่สามารถสั่งซื้อได้เนื่องจากเครดิตไม่พอ")
+            view = InsufficientCreditConfirmView(shortage=shortage, user_id=interaction.user.id)
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class CheckSelect(discord.ui.Select):
