@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import time
 from io import BytesIO
 from pathlib import Path
@@ -19,6 +20,7 @@ from binance_payout import (
     execute_binance_withdraw,
     get_binance_total_usdt_balance,
     get_network_withdrawal_status,
+    get_network_withdrawal_status_cached,
 )
 from receipt_generator import generate_crypto_receipt
 from roblox_lookup import (
@@ -1373,6 +1375,20 @@ class CryptoExchangeAssetModal(discord.ui.Modal):
                 )
                 return
 
+            try:
+                net_status = await asyncio.to_thread(get_network_withdrawal_status_cached, 60.0, True)
+                if self.asset_id in net_status and not net_status[self.asset_id].get("can_withdraw", True):
+                    notice = net_status[self.asset_id].get("notice", "ระบบกระเป๋าเครือข่ายนี้กำลังปิดซ่อมบำรุงชั่วคราว")
+                    await interaction.followup.send(
+                        f"⚠️ **ขออภัยครับ เครือข่าย {self.label} ระงับการโอนชั่วคราวจาก Binance**\n"
+                        f"• **สาเหตุ:** `{notice}`\n"
+                        f"ไม่มีการหักเครดิต กรุณาเลือกเครือข่ายอื่นแทนครับ",
+                        ephemeral=True,
+                    )
+                    return
+            except Exception:
+                pass
+
             # Deduct user balance atomically
             deducted = await asyncio.to_thread(
                 store.adjust_balance, interaction.user.id, 0, -thb_req, f"Crypto exchange: {crypto_amount} {symbol} ({self.network}) to {addr}"
@@ -1687,6 +1703,17 @@ class CryptoExchangePanelView(discord.ui.View):
         row=1,
     )
     async def refresh_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cd_key = interaction.message.id if interaction.message else interaction.channel_id
+        now_ts = time.monotonic()
+        last_ts = _REFRESH_PANEL_LAST.get(cd_key, 0.0)
+        rem = _REFRESH_PANEL_COOLDOWN_SECONDS - (now_ts - last_ts)
+        if rem > 0:
+            await interaction.response.send_message(
+                f"⏳ กรุณารอ **{math.ceil(rem)} วินาที** ก่อนกดรีเฟรชเรทอีกครั้งครับ",
+                ephemeral=True,
+            )
+            return
+        _REFRESH_PANEL_LAST[cd_key] = now_ts
         await interaction.response.defer()
         usdt_rate, ltc_rate = await fetch_live_crypto_rates(force=True)
         bal = await asyncio.to_thread(get_balance, interaction.user.id)
@@ -1701,7 +1728,7 @@ class CryptoExchangePanelView(discord.ui.View):
         # Check real-time network statuses from Binance
         net_status = {}
         try:
-            net_status = await asyncio.to_thread(get_network_withdrawal_status)
+            net_status = await asyncio.to_thread(get_network_withdrawal_status_cached, 30.0, True)
         except Exception:
             pass
 
@@ -1758,9 +1785,9 @@ class CryptoExchangePanelView(discord.ui.View):
             await interaction.followup.send("✅ อัปเดตเรทราคาล่าสุดเรียบร้อยแล้ว", ephemeral=True)
 
     async def _handle_asset_click(self, interaction: discord.Interaction, asset_id: str, label: str, network: str, placeholder: str):
-        # Pre-flight check network status from Binance
+        # Non-blocking pre-flight cache check (full Binance verification runs after modal defer)
         try:
-            net_status = await asyncio.to_thread(get_network_withdrawal_status)
+            net_status = await asyncio.to_thread(get_network_withdrawal_status_cached, 60.0, False)
             if asset_id in net_status and not net_status[asset_id].get("can_withdraw", True):
                 notice = net_status[asset_id].get("notice", "ระบบกระเป๋าเครือข่ายนี้กำลังปิดซ่อมบำรุงชั่วคราว")
                 await interaction.response.send_message(
@@ -2906,6 +2933,57 @@ intents.message_content = False
 bot = commands.Bot(command_prefix="!", intents=intents)
 _views_registered = False
 _commands_synced = False
+_shop_heartbeat_started = False
+_binance_cache_loop_started = False
+_REFRESH_PANEL_LAST = {}
+_REFRESH_PANEL_COOLDOWN_SECONDS = 20.0
+
+
+def _atomic_write_json(path_obj: Path, data: dict):
+    tmp = path_obj.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    for attempt in range(4):
+        try:
+            tmp.replace(path_obj)
+            return
+        except PermissionError:
+            if attempt == 3:
+                return
+            time.sleep(0.05)
+
+
+def _write_shop_heartbeat(ready: bool):
+    sup_dir = os.getenv("HUB_SUPERVISOR_DIR", "").strip()
+    if not sup_dir:
+        return
+    try:
+        lat = round(bot.latency * 1000, 1) if getattr(bot, "latency", None) else 0.0
+        _atomic_write_json(
+            Path(sup_dir) / "shop.json",
+            {
+                "pid": os.getpid(),
+                "tick": time.monotonic(),
+                "ts": time.time(),
+                "ready": bool(ready),
+                "component": "shop",
+                "latency_ms": lat,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _write_shop_ratelimit_cooldown(reason: str, seconds: int = 900):
+    sup_dir = os.getenv("HUB_SUPERVISOR_DIR", "").strip()
+    if not sup_dir:
+        return
+    try:
+        _atomic_write_json(
+            Path(sup_dir) / "cooldown.json",
+            {"reason": reason, "seconds": int(seconds), "pid": os.getpid(), "ts": time.time()},
+        )
+    except Exception:
+        pass
 
 
 async def resolve_panel_channel(interaction, channel=None, channel_id=None):
@@ -3482,10 +3560,27 @@ async def check_expired_roles_task():
 
 @bot.event
 async def on_ready():
-    global _views_registered, _commands_synced
+    global _views_registered, _commands_synced, _shop_heartbeat_started, _binance_cache_loop_started
     await asyncio.to_thread(init_db)
     if not check_expired_roles_task.is_running():
         check_expired_roles_task.start()
+    if not _shop_heartbeat_started:
+        _shop_heartbeat_started = True
+        async def _shop_hb_loop():
+            while not bot.is_closed():
+                _write_shop_heartbeat(bot.is_ready())
+                await asyncio.sleep(5)
+        asyncio.create_task(_shop_hb_loop())
+    if not _binance_cache_loop_started:
+        _binance_cache_loop_started = True
+        async def _binance_status_loop():
+            while not bot.is_closed():
+                try:
+                    await asyncio.to_thread(get_network_withdrawal_status_cached, 55.0, True)
+                except Exception:
+                    pass
+                await asyncio.sleep(60)
+        asyncio.create_task(_binance_status_loop())
     if not _views_registered:
         bot.add_view(ShopView())
         bot.add_view(CryptoExchangePanelView())
@@ -3496,12 +3591,9 @@ async def on_ready():
         try:
             if DISCORD_GUILD_ID:
                 guild = discord.Object(id=DISCORD_GUILD_ID)
-                bot.tree.copy_global_to(guild=guild)
-                guild_commands = await bot.tree.sync(guild=guild)
-                print(
-                    f"Synced guild commands to {DISCORD_GUILD_ID}: "
-                    f"{', '.join(command.name for command in guild_commands)}"
-                )
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+                print(f"Cleared guild command overrides on {DISCORD_GUILD_ID} (using single global command tree)")
             global_commands = await bot.tree.sync()
             print(
                 "Synced global commands: "
@@ -3660,6 +3752,15 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("ตั้งค่า DISCORD_BOT_TOKEN ในไฟล์ .env ก่อนเริ่มบอท")
-    bot.run(TOKEN)
-
-
+    _write_shop_heartbeat(False)
+    try:
+        bot.run(TOKEN)
+    except Exception as exc:
+        _write_shop_heartbeat(False)
+        msg = str(exc)
+        low = msg.lower()
+        if "429" in msg or "1015" in msg or "too many requests" in low or "rate limit" in low or "cloudflare" in low:
+            print(f"[Shop Bot] Rate-limit/CF-1015 detected ({exc}); writing 900s cooldown...", flush=True)
+            _write_shop_ratelimit_cooldown("discord-http-429-or-cf-1015", seconds=900)
+            sys.exit(10)
+        raise

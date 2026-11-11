@@ -5,6 +5,7 @@ import requests
 import asyncio
 import os
 import math
+import threading
 from typing import Dict, Any, Tuple
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "CJdPNL2J9vNdpDVfvFlOWf97PVk9RaxGFf3S2PezU0OMhtt0KNlvgLzGWrUwGVJp")
@@ -243,6 +244,10 @@ def get_binance_total_usdt_balance() -> Tuple[float, Dict[str, float]]:
     return round(total_usdt, 4), asset_dict
 
 
+_NETWORK_STATUS_LOCK = threading.Lock()
+_NETWORK_STATUS_CACHE: Dict[str, Any] = {"data": {}, "ts": 0.0}
+
+
 def get_network_withdrawal_status() -> Dict[str, Dict[str, Any]]:
     """
     Checks withdrawal and deposit status for all supported networks on Binance.
@@ -279,5 +284,30 @@ def get_network_withdrawal_status() -> Dict[str, Dict[str, Any]]:
                         "fee": float(net.get("withdrawFee", 0)),
                         "notice": net.get("withdrawDesc", ""),
                     }
+    if status_map:
+        with _NETWORK_STATUS_LOCK:
+            _NETWORK_STATUS_CACHE["data"] = status_map
+            _NETWORK_STATUS_CACHE["ts"] = time.time()
     return status_map
+
+
+def get_network_withdrawal_status_cached(max_age: float = 60.0, allow_fetch: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Non-blocking cache accessor for Binance network status.
+    Use allow_fetch=False before opening Discord modals (<3s ACK window), and allow_fetch=True
+    after defer() / in background refresh loops.
+    """
+    now = time.time()
+    with _NETWORK_STATUS_LOCK:
+        cached_data = dict(_NETWORK_STATUS_CACHE.get("data") or {})
+        cached_ts = float(_NETWORK_STATUS_CACHE.get("ts") or 0.0)
+
+    if cached_data and (now - cached_ts) <= max_age:
+        return cached_data
+
+    if not allow_fetch:
+        return cached_data
+
+    fresh = get_network_withdrawal_status()
+    return fresh if fresh else cached_data
 

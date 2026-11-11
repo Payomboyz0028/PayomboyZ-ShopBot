@@ -10,16 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Ping all 7 Render Services
+      - name: Ping Active Render Services
         run: |
           urls=(
             "https://payomboyz-shop.onrender.com"
-            "https://payomboyz-getrole.onrender.com"
             "https://payomboyz-aihub.onrender.com"
             "https://payomboyz-bypass.onrender.com"
             "https://sc-script-bot-0mtw.onrender.com"
             "https://payomboyz-solve-bot-us.onrender.com"
-            "https://payomboyz-crypto-exchange.onrender.com"
           )
           for u in "${urls[@]}"; do
             echo "Pinging $u..."
