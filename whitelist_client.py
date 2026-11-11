@@ -8,8 +8,8 @@ import requests
 import json
 from datetime import datetime, timedelta, timezone
 
-WHITELIST_API_URL = os.getenv("WHITELIST_API_URL", "https://payomboyz-flowauth.vercel.app/api/v1").rstrip("/")
-WHITELIST_API_KEY = os.getenv("WHITELIST_API_KEY", "d23c5d8d0eeaeb08b49048c566f42daee80a924f50e882c2")
+WHITELIST_API_URL = os.getenv("WHITELIST_API_URL", "https://payomboyzcreative.online/api/v1").rstrip("/")
+WHITELIST_API_KEY = os.getenv("WHITELIST_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
@@ -41,17 +41,21 @@ def register_whitelist_key(
     - ตั้งค่าโควตารีเซ็ต HWID 3 ครั้ง
     """
     tier = detect_product_tier(product_id, product_name)
-    now_utc = datetime.now(timezone.utc)
-    expires_at = (now_utc + timedelta(days=duration_days)).isoformat() if duration_days else None
+    sku = str(product_id or tier).strip().upper()
+    is_life = not duration_days or int(duration_days) >= 9000 or sku.endswith("_LIFE") or sku.startswith("SRC_") or sku == "WEB_LOG_VVIP"
+    expires_at = None # Clock starts ONLY upon 1st Roblox HWID execution
 
     payload = {
       "key_string": key_string,
       "role": tier,
-      "status": "active",
-      "discord_id": discord_id,
+      "sku": sku,
+      "duration_days": None if is_life else int(duration_days),
+      "is_lifetime": is_life,
+      "status": "ready",
+      "discord_id": str(discord_id),
       "discord_name": discord_name,
-      "expires_at": expires_at,
-      "hwid_resets_left": 3,
+      "expires_at": None,
+      "hwid_resets_left": 999 if tier == "SUPERVIP" else (5 if tier == "VVIP" else 3),
       "note": f"Discord Purchase: {product_name} (User: {discord_name} / {discord_id})"
     }
 

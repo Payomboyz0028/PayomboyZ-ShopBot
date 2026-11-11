@@ -66,11 +66,26 @@ def list_products(active_only=False):
         print(f"[Supabase list_products Error] {e}")
         return []
 
+def normalize_sku(product_id: str) -> str:
+    c = str(product_id or "").strip().upper().replace("-", "_")
+    if c == "VIP_30":
+        return "VIP"
+    if c == "VVIP_30":
+        return "VVIP"
+    if c == "ATQ":
+        return "AUTO_QUEST"
+    return c
+
+
 def get_product(product_id):
-    """Retrieve single product by ID."""
+    """Retrieve single product by canonical SKU or product_id."""
     try:
         sb = get_sb()
-        res = sb.table("shop_products").select("*").eq("product_id", str(product_id).strip()).execute()
+        raw = str(product_id).strip()
+        canon = normalize_sku(raw)
+        res = sb.table("shop_products").select("*").eq("product_id", canon).execute()
+        if not res.data and canon != raw:
+            res = sb.table("shop_products").select("*").eq("product_id", raw).execute()
         if not res.data:
             return None
         r = res.data[0]
@@ -245,39 +260,42 @@ def adjust_balance(user_id, admin_id, delta, reason):
         return False
 
 def credit_topup(user_id, amount, payment_ref):
-    """Process topup atomically: record in topups and increment balance across members & customers."""
+    """Process topup atomically via fn_credit_topup_atomic PostgreSQL RPC."""
     try:
         uid = int(user_id)
         amt = float(amount)
         pref = str(payment_ref).strip()
         sb = get_sb()
+        channel = "TRUEMONEY" if pref.startswith(("truemoney:", "tmn:")) else ("CRYPTO" if pref.startswith("crypto:") else "BANK_SLIP")
+        rpc_res = sb.rpc("fn_credit_topup_atomic", {
+            "p_discord_id": str(uid),
+            "p_username": "",
+            "p_discord_name": "",
+            "p_amount": amt,
+            "p_channel": channel,
+            "p_payment_ref": pref,
+            "p_source_mark": "[DISCORD_BOT4]",
+        }).execute()
+        data = rpc_res.data
+        if isinstance(data, dict):
+            if data.get("success"):
+                try:
+                    sb.table("topups").upsert({"payment_ref": pref, "user_id": uid, "amount": amt}, on_conflict="payment_ref").execute()
+                except Exception:
+                    pass
+                return True
+            if data.get("code") == "DUPLICATE_PAYMENT_REF":
+                return False
 
-        # 1. Check idempotency (prevent double credit)
+        # Legacy fallback only if RPC absent
         existing = sb.table("topups").select("payment_ref").eq("payment_ref", pref).execute()
         if existing.data and len(existing.data) > 0:
-            print(f"[Topup] Payment {pref} already credited.")
             return False
-
-        # 2. Insert topup receipt
-        sb.table("topups").insert({
-            "payment_ref": pref,
-            "user_id": uid,
-            "amount": amt,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
-
-        # 3. Increment balance & total_topup
+        sb.table("topups").insert({"payment_ref": pref, "user_id": uid, "amount": amt, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
         cur_res = sb.table("members").select("balance, total_topup").eq("discord_id", uid).execute()
-        cur_bal = 0.0
-        cur_topup = 0.0
-        if cur_res.data and len(cur_res.data) > 0:
-            cur_bal = float(cur_res.data[0].get("balance") or 0.0)
-            cur_topup = float(cur_res.data[0].get("total_topup") or 0.0)
-
-        new_bal = cur_bal + amt
-        new_topup = cur_topup + amt
-
-        _sync_user_balance_and_topup(sb, uid, new_bal, new_topup)
+        cur_bal = float(cur_res.data[0].get("balance") or 0.0) if cur_res.data else 0.0
+        cur_topup = float(cur_res.data[0].get("total_topup") or 0.0) if cur_res.data else 0.0
+        _sync_user_balance_and_topup(sb, uid, cur_bal + amt, cur_topup + amt)
 
         # 4. Audit log
         try:
@@ -325,91 +343,41 @@ def _resolve_product_tier(product_id: str, product_name: str = "") -> str:
 
 def buy_key(user_id, product_id, price):
     """
-    Atomic unified key purchase:
-    1. Checks customer balance from Supabase members.
-    2. Finds available key or auto-generates a valid tier key.
-    3. Deducts balance from Supabase members.
-    4. Registers key with status='active', assigned to user.
-    5. Records purchase in public.purchases and public.audit_logs.
+    Atomic SKU-exact purchase via PostgreSQL RPC fn_purchase_with_balance_atomic:
+    - ZERO auto-minting when stock is empty.
+    - Timed keys keep expires_at = NULL (countdown starts on 1st HWID execution).
     """
     try:
         uid = int(user_id)
-        pid = str(product_id).strip()
-        cost = float(price)
+        canon_pid = normalize_sku(product_id)
         sb = get_sb()
-
-        product = get_product(pid)
-        if not product or not product["active"]:
-            return None, "ไม่พบสินค้าหรือสินค้าปิดขายแล้ว"
-
-        cur_bal = get_balance(uid)
-        if cur_bal < cost:
-            return None, "เครดิตไม่พอ"
-
-        tier = _resolve_product_tier(pid, product["name"])
-        days = int(product.get("role_days") or 0)
         now = datetime.now(timezone.utc)
-        expiry = (now + timedelta(days=days)).isoformat() if days > 0 and days < 9000 else None
-        hwid_resets = 999 if tier in ("SUPERVIP", "WEB_LOG_VVIP") else (5 if tier == "VVIP" else 3)
         order_id = f"pbg_{int(now.timestamp() * 1000)}_{uuid.uuid4().hex[:5]}"
 
-        # 1. Search for pre-seeded available key matching tier
-        key_record = None
-        avail_res = sb.table("license_keys").select("id, key_string").eq("role", tier).eq("status", "available").limit(1).execute()
-        if avail_res.data and len(avail_res.data) > 0:
-            key_record = avail_res.data[0]
-            key_string = key_record["key_string"]
-            # Assign existing key
-            sb.table("license_keys").update({
-                "status": "active",
-                "discord_id": uid,
-                "discord_name": f"user_{uid}",
-                "expires_at": expiry,
-                "note": f"Shop Purchase: {product['name']} | Order: {order_id}",
-                "updated_at": now.isoformat()
-            }).eq("id", key_record["id"]).execute()
-        else:
-            # Auto-generate new cryptographically secure key
-            rand_code = "-".join("".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4)) for _ in range(4))
-            key_string = f"PAYOM-{tier}-{rand_code}"
-            sb.table("license_keys").insert({
-                "key_string": key_string,
-                "role": tier,
-                "status": "active",
-                "discord_id": uid,
-                "discord_name": f"user_{uid}",
-                "expires_at": expiry,
-                "hwid_resets_left": hwid_resets,
-                "note": f"Shop Purchase: {product['name']} | Order: {order_id}",
-                "created_at": now.isoformat(),
-                "updated_at": now.isoformat()
-            }).execute()
-
-        # 2. Deduct balance from Supabase members
-        new_bal = cur_bal - cost
-        sb.table("members").update({
-            "balance": new_bal,
-            "last_active": now.isoformat()
-        }).eq("discord_id", uid).execute()
-
-        # 3. Record purchase in public.purchases
-        sb.table("purchases").insert({
-            "id": order_id,
-            "user_id": uid,
-            "product": pid,
-            "price": cost,
-            "status": "complete",
-            "created_at": now.isoformat()
+        rpc_res = sb.rpc("fn_purchase_with_balance_atomic", {
+            "p_discord_id": str(uid),
+            "p_username": "",
+            "p_discord_name": "",
+            "p_product_id": canon_pid,
+            "p_order_id": order_id,
+            "p_source_mark": "[DISCORD_BOT4]",
         }).execute()
+        res = rpc_res.data if isinstance(rpc_res.data, dict) else {}
+        if not res.get("success"):
+            code = str(res.get("code") or "")
+            if code == "INSUFFICIENT_BALANCE":
+                return None, "เครดิตไม่พอ"
+            return None, res.get("error") or "สินค้าในสต็อกหมดชั่วคราว กรุณาติดต่อแอดมิน"
 
-        # 4. Record in audit_logs
+        key_string = res.get("key_string") or ""
         try:
-            sb.table("audit_logs").insert({
-                "action": "KEY_PURCHASE",
-                "actor": str(uid),
-                "target_key": key_string,
-                "details": {"product_id": pid, "product_name": product["name"], "price": cost, "order_id": order_id, "new_balance": new_bal},
-                "ip_address": "discord_bot"
+            sb.table("purchases").insert({
+                "id": order_id,
+                "user_id": uid,
+                "product": canon_pid,
+                "price": float(res.get("price") or price),
+                "status": "complete",
+                "created_at": now.isoformat()
             }).execute()
         except Exception:
             pass
@@ -417,7 +385,10 @@ def buy_key(user_id, product_id, price):
         return {
             "key": key_string,
             "purchase_id": order_id,
-            "new_balance": new_bal
+            "new_balance": float(res.get("new_balance") or 0),
+            "duration_days": res.get("duration_days"),
+            "is_lifetime": bool(res.get("is_lifetime")),
+            "mentor_code": res.get("mentor_code"),
         }, None
 
     except Exception as e:
@@ -622,16 +593,32 @@ def list_keys(product_id=None, available_only=False):
         return []
 
 def key_counts():
-    """Count keys by status."""
+    """Return exact per-SKU available counts (unstarted, excluding [Do Not Sell] & FREE)."""
     try:
         sb = get_sb()
-        total = sb.table("license_keys").select("id", count="exact", head=True).execute().count or 0
-        avail = sb.table("license_keys").select("id", count="exact", head=True).eq("status", "available").execute().count or 0
-        sold = sb.table("license_keys").select("id", count="exact", head=True).eq("status", "active").execute().count or 0
-        return {"total": total, "available": avail, "sold": sold}
+        res = (
+            sb.table("license_keys")
+            .select("sku, role, note")
+            .eq("status", "available")
+            .is_("hwid", "null")
+            .limit(5000)
+            .execute()
+        )
+        by_sku: dict[str, int] = {}
+        for row in (res.data or []):
+            note = str(row.get("note") or "")
+            if "[Do Not Sell]" in note or "[Archived" in note:
+                continue
+            k_sku = str(row.get("sku") or row.get("role") or "").strip().upper()
+            if not k_sku or k_sku == "FREE":
+                continue
+            by_sku[k_sku] = by_sku.get(k_sku, 0) + 1
+        by_sku["VIP_30"] = by_sku.get("VIP", 0)
+        by_sku["VVIP_30"] = by_sku.get("VVIP", 0)
+        return by_sku
     except Exception as e:
         print(f"[Supabase key_counts Error] {e}")
-        return {"total": 0, "available": 0, "sold": 0}
+        return {}
 
 def check_key(user_id, secret):
     """Lookup key status for user."""

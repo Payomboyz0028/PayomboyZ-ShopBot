@@ -108,7 +108,7 @@ def get_product_prices():
 
 
 CLOUD_WEB_URL = os.getenv("CLOUD_WEB_URL", "https://payomboyz.shop").rstrip("/")
-CLOUD_SYNC_KEY = os.getenv("CLOUD_SYNC_KEY", "280342")
+CLOUD_SYNC_KEY = os.getenv("CLOUD_SYNC_KEY", "")
 
 
 def get_cloud_sync_headers():
@@ -2093,14 +2093,20 @@ async def execute_confirmed_purchase(interaction, product_id):
     order_id = result["purchase_id"]
     bal_now = result.get("new_balance", await asyncio.to_thread(store.get_balance, user_id))
 
+    dur_d = result.get("duration_days")
+    is_life = bool(result.get("is_lifetime"))
+    mentor_code = result.get("mentor_code")
+    dur_label = "♾️ ถาวร (Lifetime)" if is_life else f"⏳ {dur_d or 30} วัน (เริ่มนับเมื่อรัน HWID ครั้งแรก)"
+    mentor_line = f"\n🎓 **Mentoring Pass Code:** `{mentor_code}`" if mentor_code else ""
     receipt_embed = discord.Embed(
         title="🎉 สั่งซื้อสินค้าสำเร็จ (License Key Delivered)",
         description=(
             f"ขอขอบคุณที่ใช้บริการ **PAYOMBØYZ-SHOP**\n\n"
             f"• **สินค้า**: **{product['name']}**\n"
+            f"• **อายุสิทธิ์**: {dur_label}\n"
             f"• **หักเครดิต**: **{price:,} ฿**\n"
             f"• **รหัสคำสั่งซื้อ**: `{order_id}`\n"
-            f"• **เครดิตคงเหลือ**: `{bal_now:,.2f} ฿`\n\n"
+            f"• **เครดิตคงเหลือ**: `{bal_now:,.2f} ฿`{mentor_line}\n\n"
             f"🔑 **คีย์ของคุณ (เก็บไว้เป็นความลับ ห้ามเปิดเผย):**\n"
             f"```{delivered_key}```\n"
             f"📌 **ช่องทางเปิดใช้งาน & ขอรับสิทธิ์:**\n"
@@ -2185,28 +2191,33 @@ class ProductSelect(discord.ui.Select):
 
 
 
-        product_id = self.values[0]
+        raw_pid = self.values[0]
+        await _handle_shop_product_choice(interaction, raw_pid)
 
+        return
+
+
+async def _handle_shop_product_choice(interaction: discord.Interaction, raw_pid: str):
+    product_id = store.normalize_sku(raw_pid) if hasattr(store, "normalize_sku") else raw_pid
+    if True:
         try:
-
             product = await asyncio.to_thread(store.get_product, product_id)
-
             if not product or not product["active"]:
-
                 await interaction.followup.send("❌ สินค้านี้ไม่มีขายแล้วครับ", ephemeral=True)
-
                 return
 
-
+            if product["delivery_type"] in ("key", "src_download", "src_download_mentor"):
+                counts = await asyncio.to_thread(key_stock)
+                sku_stock = int(counts.get(product["product_id"], 0))
+                if sku_stock <= 0:
+                    await interaction.followup.send(f"⚠️ สินค้า **{product['name']}** หมดสต็อกชั่วคราว (0 คีย์)", ephemeral=True)
+                    return
 
             price = int(product["price"])
-
             balance = await asyncio.to_thread(store.get_balance, interaction.user.id)
 
-
-
-            if product["delivery_type"] == "key":
-                delivery_desc = "🔑 **รับ License Key ทันที** (ระบบจัดส่งอัตโนมัติ 24 ชม.)"
+            if product["delivery_type"] in ("key", "src_download", "src_download_mentor"):
+                delivery_desc = "🔑 **รับ License Key + ดาวน์โหลดไฟล์อัตโนมัติ** (24 ชม.)"
             else:
 
                 role_days = int(product.get("role_days", 0) or 0)
@@ -2535,7 +2546,7 @@ class ProductButtonCatalogView(discord.ui.View):
 
         self.user_id = user_id
 
-        for idx, p in enumerate(products[:12]):
+        for idx, p in enumerate(products[:15]):
 
             row = min(idx // 3, 4)
 
@@ -3445,7 +3456,7 @@ async def sync_web_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     cloud_url = CLOUD_WEB_URL
     try:
-        r = await asyncio.to_thread(requests.get, f"{cloud_url}/api/sync?key=280342", timeout=6)
+        r = await asyncio.to_thread(requests.get, f"{cloud_url}/api/sync?action=stock", headers=get_cloud_sync_headers(), timeout=6)
         if r.status_code == 200:
             data = r.json()
             embed = discord.Embed(
@@ -3624,6 +3635,83 @@ async def on_ready():
         pass  # Disabled legacy embed posting
     except discord.Forbidden:
         print("Bot needs permission to post or edit the shop panel")
+
+
+class ShopResetHwidModal(discord.ui.Modal, title="รีเซ็ต HWID คีย์สคริปต์"):
+    key_input = discord.ui.TextInput(
+        label="License Key ที่ต้องการรีเซ็ต HWID *",
+        placeholder="เช่น PAYOM-VIP-XXXX-XXXX",
+        required=True,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            import whitelist_client
+            ok, msg = await asyncio.to_thread(whitelist_client.reset_hwid_by_discord, interaction.user.id, self.key_input.value.strip())
+            await interaction.followup.send(f"{'✅' if ok else '❌'} {msg}", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ รีเซ็ต HWID ไม่สำเร็จ: {exc}", ephemeral=True)
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Handle #buy Components V2 container select menu & action buttons reliably."""
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    cid = data.get("custom_id", "")
+
+    if cid == "shop_product_select":
+        if interaction.response.is_done():
+            return
+        values = data.get("values") or []
+        if not values or values[0] == "__none__":
+            await interaction.response.send_message("ยังไม่มีสินค้าเปิดขายครับ", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        if not await require_verified(interaction):
+            return
+        await _handle_shop_product_choice(interaction, values[0])
+        return
+
+    if cid == "btn_shop_topup":
+        if not interaction.response.is_done():
+            embed = discord.Embed(
+                title="💳 เลือกช่องทางเติมเครดิต",
+                description=(
+                    "**📱 PromptPay QR (ล็อคยอดเงิน)** — สแกนจ่าย ยอดเข้าทันที\n"
+                    "**🏦 แนบสลิปโอนเงิน (EasySlip Auto)** — อัปโหลดสลิปผ่าน DM หรือ `/slip`\n"
+                    "**💚 ซอง TrueMoney** — วางลิงก์ซองของขวัญ\n"
+                    "**🪙 Crypto (USDT / LTC)** — เติมผ่านเชนอัตโนมัติ"
+                ),
+                color=0x2ECC71,
+            )
+            await interaction.response.send_message(embed=embed, view=TopupMethodView(), ephemeral=True)
+        return
+
+    if cid == "btn_shop_history":
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        bal = await asyncio.to_thread(get_balance, interaction.user.id)
+        purchases = await asyncio.to_thread(store.list_purchases, interaction.user.id)
+        hist = "\n".join(
+            f"• `{p.get('product') or 'KEY'}` — {float(p.get('price') or 0):,.2f}฿"
+            for p in purchases[:8]
+        ) or "ยังไม่มีประวัติการสั่งซื้อ"
+        embed = discord.Embed(
+            title="📜 กระเป๋าเครดิต & ประวัติคำสั่งซื้อ",
+            description=f"👤 <@{interaction.user.id}>\n💰 **เครดิตคงเหลือ:** `{bal:,.2f} ฿`\n\n**รายการล่าสุด:**\n{hist}",
+            color=0x00F0FF,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if cid == "btn_shop_hwid_reset":
+        if not interaction.response.is_done():
+            await interaction.response.send_modal(ShopResetHwidModal())
+        return
 
 
 @bot.event
